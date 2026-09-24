@@ -99,6 +99,7 @@ export class BondsController {
   @Post(':id/claim')
   @UseGuards(JwtAuthGuard, KycGuard)
   @Idempotent()
+  @RateLimit({ type: 'mutation' })
   @HttpCode(HttpStatus.OK)
   async claimCredits(
     @Param('id', ParseIntPipe) id: number,
