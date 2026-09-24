@@ -1574,6 +1574,194 @@ mod test {
         assert_eq!(result, Err(Ok(DEXError::OrderExpired)));
     }
 
+    // --- Order replay / stale-state hardening (#215) ---
+    //
+    // Cross-network and cross-contract replay are enforced by the Soroban host's
+    // native-auth preimage (network id + target contract + args), which
+    // `mock_all_auths` bypasses, so they are documented in
+    // docs/security/order-signing-replay-protection.md rather than exercised
+    // here. These tests cover the contract-level guards: fully-filled replay,
+    // partial-fill over-fill, remaining-amount accounting, and the explicit
+    // per-account nonce.
+
+    #[test]
+    fn test_filled_order_cannot_be_repurchased() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let admin = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let (_issuer_admin, issuer_id, bond_id, seller) =
+            setup_bond_and_holder(&env, 10_000, 5_000);
+
+        let contract_id = env.register(
+            DEXRouter,
+            (admin.clone(), issuer_id, Address::generate(&env)),
+        );
+        let client = DEXRouterClient::new(&env, &contract_id);
+
+        let order_id = client.list_bond_tokens(
+            &seller,
+            &bond_id,
+            &1_000i128,
+            &100i128,
+            &Symbol::new(&env, "USDC"),
+            &3600u64,
+            &0,
+        );
+        client.deposit_quote(&buyer, &Symbol::new(&env, "USDC"), &1_000_000i128, &0);
+
+        // Fully fill the order.
+        client.execute_purchase(&buyer, &order_id, &100i128, &1_000i128, &1);
+        assert_eq!(client.get_order(&order_id).status, OrderStatus::Filled);
+
+        // Replaying the (now Filled) order must be rejected, even for 1 unit.
+        let replay = client.try_execute_purchase(&buyer, &order_id, &100i128, &1i128, &2);
+        assert_eq!(replay, Err(Ok(DEXError::OrderAlreadyFilled)));
+    }
+
+    #[test]
+    fn test_partial_order_cannot_be_overfilled() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let admin = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let (_issuer_admin, issuer_id, bond_id, seller) =
+            setup_bond_and_holder(&env, 10_000, 5_000);
+
+        let contract_id = env.register(
+            DEXRouter,
+            (admin.clone(), issuer_id, Address::generate(&env)),
+        );
+        let client = DEXRouterClient::new(&env, &contract_id);
+
+        let order_id = client.list_bond_tokens(
+            &seller,
+            &bond_id,
+            &1_000i128,
+            &100i128,
+            &Symbol::new(&env, "USDC"),
+            &3600u64,
+            &0,
+        );
+        client.deposit_quote(&buyer, &Symbol::new(&env, "USDC"), &1_000_000i128, &0);
+
+        // Fill 400 of 1000; remaining must be tracked on-chain as 600.
+        client.execute_purchase(&buyer, &order_id, &100i128, &400i128, &1);
+        let order = client.get_order(&order_id);
+        assert_eq!(order.status, OrderStatus::PartiallyFilled);
+        assert_eq!(order.amount, 600);
+
+        // Attempting to buy 601 (more than the remaining 600) must be rejected.
+        let overfill = client.try_execute_purchase(&buyer, &order_id, &100i128, &601i128, &2);
+        assert_eq!(overfill, Err(Ok(DEXError::InsufficientBalance)));
+    }
+
+    #[test]
+    fn test_partial_fills_decrement_remaining_to_filled() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let admin = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let (_issuer_admin, issuer_id, bond_id, seller) =
+            setup_bond_and_holder(&env, 10_000, 5_000);
+
+        let contract_id = env.register(
+            DEXRouter,
+            (admin.clone(), issuer_id, Address::generate(&env)),
+        );
+        let client = DEXRouterClient::new(&env, &contract_id);
+
+        let order_id = client.list_bond_tokens(
+            &seller,
+            &bond_id,
+            &1_000i128,
+            &100i128,
+            &Symbol::new(&env, "USDC"),
+            &3600u64,
+            &0,
+        );
+        client.deposit_quote(&buyer, &Symbol::new(&env, "USDC"), &1_000_000i128, &0);
+
+        client.execute_purchase(&buyer, &order_id, &100i128, &600i128, &1);
+        assert_eq!(client.get_order(&order_id).amount, 400);
+
+        client.execute_purchase(&buyer, &order_id, &100i128, &400i128, &2);
+        assert_eq!(client.get_order(&order_id).status, OrderStatus::Filled);
+
+        // No units remain to replay.
+        let replay = client.try_execute_purchase(&buyer, &order_id, &100i128, &1i128, &3);
+        assert_eq!(replay, Err(Ok(DEXError::OrderAlreadyFilled)));
+    }
+
+    #[test]
+    fn test_stale_nonce_replay_rejected() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+        let (_issuer_admin, issuer_id, _bond_id, _seller) =
+            setup_bond_and_holder(&env, 10_000, 5_000);
+
+        let contract_id = env.register(
+            DEXRouter,
+            (admin.clone(), issuer_id, Address::generate(&env)),
+        );
+        let client = DEXRouterClient::new(&env, &contract_id);
+
+        let usdc = Symbol::new(&env, "USDC");
+        assert_eq!(client.get_nonce(&user), 0);
+        client.deposit_quote(&user, &usdc, &100i128, &0);
+        assert_eq!(client.get_nonce(&user), 1);
+
+        // Replaying nonce 0 (already consumed) is rejected.
+        let replay = client.try_deposit_quote(&user, &usdc, &100i128, &0);
+        assert_eq!(replay, Err(Ok(DEXError::InvalidNonce)));
+
+        // A skipped/future nonce is also rejected — nonces are strictly sequential.
+        let skipped = client.try_deposit_quote(&user, &usdc, &100i128, &5);
+        assert_eq!(skipped, Err(Ok(DEXError::InvalidNonce)));
+    }
+
+    #[test]
+    fn test_nonce_is_per_account_and_monotonic() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let admin = Address::generate(&env);
+        let (_issuer_admin, issuer_id, bond_id, seller) =
+            setup_bond_and_holder(&env, 10_000, 5_000);
+
+        let contract_id = env.register(
+            DEXRouter,
+            (admin.clone(), issuer_id, Address::generate(&env)),
+        );
+        let client = DEXRouterClient::new(&env, &contract_id);
+
+        // One shared, strictly-increasing nonce across all of an account's
+        // actions: listing consumes nonce 0, so a cancel replaying nonce 0 fails.
+        let order_id = client.list_bond_tokens(
+            &seller,
+            &bond_id,
+            &1_000i128,
+            &100i128,
+            &Symbol::new(&env, "USDC"),
+            &3600u64,
+            &0,
+        );
+        assert_eq!(client.get_nonce(&seller), 1);
+
+        let stale = client.try_cancel_listing(&seller, &order_id, &0);
+        assert_eq!(stale, Err(Ok(DEXError::InvalidNonce)));
+
+        // The correct next nonce succeeds.
+        client.cancel_listing(&seller, &order_id, &1);
+        assert_eq!(client.get_order(&order_id).status, OrderStatus::Cancelled);
+    }
+
     mod property {
         extern crate std;
 
