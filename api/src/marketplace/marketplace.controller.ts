@@ -60,6 +60,7 @@ export class MarketplaceController {
 
   @Post('list')
   @Idempotent()
+  @RateLimit({ type: 'mutation' })
   @HttpCode(HttpStatus.CREATED)
   async listBondTokens(
     @Body() dto: ListBondDto,
@@ -71,6 +72,7 @@ export class MarketplaceController {
 
   @Post('buy')
   @Idempotent()
+  @RateLimit({ type: 'mutation' })
   @HttpCode(HttpStatus.OK)
   async buyBondTokens(
     @Body() dto: BuyBondDto,
@@ -123,6 +125,7 @@ export class MarketplaceController {
   }
 
   @Delete('orders/:id')
+  @RateLimit({ type: 'mutation' })
   @HttpCode(HttpStatus.NO_CONTENT)
   async cancelOrder(
     @Param('id', ParseIntPipe) id: number,
