@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, BytesN, Symbol, Vec};
+use soroban_sdk::{contracttype, Address, BytesN, Symbol, Vec};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[contracttype]
@@ -73,6 +73,28 @@ pub struct RedemptionCoverage {
 pub type BondId = u64;
 pub type ReportId = u64;
 pub type OrderId = u64;
+
+/// A sequestration report as stored by oracle-consumer. Lives here so that
+/// coupon-engine can decode it over `invoke_contract` without linking the
+/// oracle-consumer contract crate, which would duplicate its exported
+/// symbols in coupon-engine's wasm.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct Report {
+    pub id: u64,
+    pub provider: Address,
+    pub project_id: BytesN<32>,
+    pub period_start: u64,
+    pub period_end: u64,
+    pub carbon_sequestered: i128,
+    pub biodiversity: BiodiversityMetrics,
+    pub methodology: Symbol,
+    pub ipfs_evidence_hash: BytesN<32>,
+    pub status: ReportStatus,
+    pub submitted_at: u64,
+    pub verified_at: u64,
+    pub provider_stake_at_verification: Option<i128>,
+}
 
 #[derive(Clone)]
 #[contracttype]

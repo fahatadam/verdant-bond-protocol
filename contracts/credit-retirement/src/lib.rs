@@ -126,14 +126,25 @@ impl CreditRetirement {
             vec![&env, bond_id.into_val(&env), holder.clone().into_val(&env)],
         );
 
-        let retired_key = DataKey::RetiredPerBond(bond_id, holder.clone());
-        let already_retired: i128 = env.storage().instance().get(&retired_key).unwrap_or(0);
-        let remaining = accrued
-            .checked_sub(already_retired)
-            .ok_or(CreditError::InsufficientCredits)?;
-        if amount > remaining {
+        if amount > accrued {
             return Err(CreditError::InsufficientCredits);
         }
+
+        // Settle against the coupon ledger before minting anything: the same
+        // credits must not be retirable here and later claimable there.
+        env.invoke_contract::<()>(
+            &coupon_engine,
+            &Symbol::new(&env, "consume_credits"),
+            vec![
+                &env,
+                holder.clone().into_val(&env),
+                bond_id.into_val(&env),
+                amount.into_val(&env),
+            ],
+        );
+
+        let retired_key = DataKey::RetiredPerBond(bond_id, holder.clone());
+        let already_retired: i128 = env.storage().instance().get(&retired_key).unwrap_or(0);
         env.storage()
             .instance()
             .set(&retired_key, &(already_retired + amount));
@@ -331,6 +342,20 @@ mod test {
             &0,
         );
         oc_client.verify_report(admin, &report_id, &1);
+
+        // DEFAULT_SIGNATURE_THRESHOLD is 2, so the admin's verification alone
+        // leaves the report Pending. Register a second, independently staked
+        // verifier to reach the threshold, matching the oracle design doc and
+        // coupon-engine's submit_verified_report helper.
+        let second_verifier = Address::generate(env);
+        oc_client.register_provider(admin, &second_verifier, &Symbol::new(env, "satellite"), &2);
+        oc_client.add_stake(
+            &second_verifier,
+            &nbbs_oracle_consumer::DEFAULT_MIN_VERIFIER_STAKE,
+            &0,
+        );
+        oc_client.verify_report(&second_verifier, &report_id, &1);
+
         report_id
     }
 
@@ -341,6 +366,7 @@ mod test {
         holder: Address,
         bond_id: u64,
         accrued: i128,
+        ce_client: CouponEngineClient<'static>,
     }
 
     fn setup() -> Setup {
@@ -394,7 +420,42 @@ mod test {
             holder,
             bond_id,
             accrued,
+            ce_client,
         }
+    }
+
+    #[test]
+    fn test_retire_debits_coupon_ledger_and_blocks_double_spend() {
+        let s = setup();
+        let half = s.accrued / 2;
+
+        s.client.retire_credits(
+            &s.holder,
+            &s.bond_id,
+            &half,
+            &CreditType::Carbon,
+            &make_certificate_hash(&s._env, 1),
+            &0,
+        );
+        assert_eq!(
+            s.ce_client.accrued_credits(&s.bond_id, &s.holder),
+            s.accrued - half
+        );
+
+        s.client.retire_credits(
+            &s.holder,
+            &s.bond_id,
+            &(s.accrued - half),
+            &CreditType::Carbon,
+            &make_certificate_hash(&s._env, 2),
+            &1,
+        );
+        assert_eq!(s.ce_client.accrued_credits(&s.bond_id, &s.holder), 0);
+
+        // Retired credits are gone from the coupon ledger, so a claim after
+        // retirement yields nothing.
+        assert_eq!(s.ce_client.claim_credits(&s.holder, &s.bond_id, &0), 0);
+        assert_eq!(s.client.get_total_retired(&s.holder), s.accrued);
     }
 
     #[test]

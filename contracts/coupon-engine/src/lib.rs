@@ -1,7 +1,7 @@
 #![no_std]
 #![allow(deprecated)]
 #![allow(clippy::too_many_arguments)]
-use nbbs_oracle_consumer::Report;
+use nbbs_shared::Report;
 use nbbs_shared::{BiodiversityMetrics, BondError, CreditType, ReportStatus};
 use soroban_sdk::{
     contract, contractimpl, contracttype, vec, Address, BytesN, Env, IntoVal, Symbol, Vec,
@@ -584,13 +584,7 @@ impl CouponEngine {
                 .get(&DataKey::PeriodCount(bond_id))
                 .unwrap_or(0);
             for period_index in 0..period_count {
-                clear_period_holder(
-                    &env,
-                    bond_id,
-                    period_index,
-                    &caller,
-                    CreditType::Carbon,
-                );
+                clear_period_holder(&env, bond_id, period_index, &caller, CreditType::Carbon);
                 clear_period_holder(
                     &env,
                     bond_id,
@@ -607,6 +601,72 @@ impl CouponEngine {
         );
 
         Ok(accrued)
+    }
+
+    /// Debits `amount` minor units from `holder`'s accrued balance on
+    /// `bond_id`. This is the settlement hook behind `retire_credits`: the
+    /// retirement contract calls it before minting a certificate, so credits
+    /// that have been retired can never also be withdrawn through
+    /// `claim_credits`. The holder authorizes the call as a sub-invocation of
+    /// `retire_credits`, which already consumed their nonce there, so none is
+    /// taken here. Per-period and per-type entries are drained oldest-first
+    /// so the itemized provenance view keeps matching the combined balance.
+    pub fn consume_credits(
+        env: Env,
+        holder: Address,
+        bond_id: u64,
+        amount: i128,
+    ) -> Result<(), BondError> {
+        holder.require_auth();
+
+        if amount <= 0 {
+            return Err(BondError::ZeroAmount);
+        }
+
+        let key = DataKey::AccruedCredits(bond_id, holder.clone());
+        let accrued: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        if amount > accrued {
+            return Err(BondError::Overflow);
+        }
+        env.storage().persistent().set(&key, &(accrued - amount));
+
+        let period_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PeriodCount(bond_id))
+            .unwrap_or(0);
+        let mut left = amount;
+        for period_index in 0..period_count {
+            for credit_type in [CreditType::Carbon, CreditType::Biodiversity] {
+                if left == 0 {
+                    break;
+                }
+                let period_key =
+                    DataKey::PeriodHolder(bond_id, period_index, holder.clone(), credit_type);
+                let entry: i128 = env.storage().persistent().get(&period_key).unwrap_or(0);
+                if entry <= 0 {
+                    continue;
+                }
+                let take = entry.min(left);
+                env.storage().persistent().set(&period_key, &(entry - take));
+
+                let by_type_key =
+                    DataKey::AccruedCreditsByType(bond_id, holder.clone(), credit_type);
+                let by_type: i128 = env.storage().persistent().get(&by_type_key).unwrap_or(0);
+                env.storage().persistent().set(
+                    &by_type_key,
+                    &by_type.checked_sub(take).ok_or(BondError::Overflow)?,
+                );
+                left -= take;
+            }
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "credits_consumed"),),
+            (bond_id, holder, amount),
+        );
+
+        Ok(())
     }
 
     pub fn get_period_info(
@@ -751,7 +811,9 @@ fn accrue_credits(
     let period_amount: i128 = env.storage().persistent().get(&period_key).unwrap_or(0);
     env.storage().persistent().set(
         &period_key,
-        &period_amount.checked_add(amount).ok_or(BondError::Overflow)?,
+        &period_amount
+            .checked_add(amount)
+            .ok_or(BondError::Overflow)?,
     );
 
     let combined_key = DataKey::AccruedCredits(bond_id, holder);
@@ -903,7 +965,7 @@ mod test {
     /// Consumes 3 of the admin's OracleConsumer nonces: registering the
     /// reporting provider (`admin_nonce`), the admin's own verification
     /// (`admin_nonce + 1`), and registering a second, independent verifier
-    /// (`admin_nonce + 2`) to satisfy the default 2-verifier threshold — the
+    /// (`admin_nonce + 2`) to satisfy the default 2-verifier threshold. The
     /// admin's signature alone isn't sufficient (see "Multi-Source
     /// Verification Threshold" in docs/oracle-design.md).
     fn submit_verified_report(
@@ -1112,11 +1174,10 @@ mod test {
             .client
             .distribute_coupon(&t.admin, &bond_id, &0, &holders, &report_id, &1);
 
-        let total = (500 * HABITAT_CREDIT_RATE
-            + 125 * SPECIES_CREDIT_RATE
-            + 1_000 * UNIT_CREDIT_RATE)
-            * CREDIT_MINOR_UNITS
-            / HABITAT_CREDIT_RATE;
+        let total =
+            (500 * HABITAT_CREDIT_RATE + 125 * SPECIES_CREDIT_RATE + 1_000 * UNIT_CREDIT_RATE)
+                * CREDIT_MINOR_UNITS
+                / HABITAT_CREDIT_RATE;
         assert_eq!(result.total_credits, total);
 
         let accrued = t.client.accrued_credits(&bond_id, &holder);
@@ -1164,11 +1225,10 @@ mod test {
             .client
             .distribute_coupon(&t.admin, &bond_id, &0, &holders, &report_id, &1);
 
-        let bio_total = (500 * HABITAT_CREDIT_RATE
-            + 125 * SPECIES_CREDIT_RATE
-            + 1_000 * UNIT_CREDIT_RATE)
-            * CREDIT_MINOR_UNITS
-            / HABITAT_CREDIT_RATE;
+        let bio_total =
+            (500 * HABITAT_CREDIT_RATE + 125 * SPECIES_CREDIT_RATE + 1_000 * UNIT_CREDIT_RATE)
+                * CREDIT_MINOR_UNITS
+                / HABITAT_CREDIT_RATE;
         let carbon_total = 100 * CREDIT_MINOR_UNITS;
         assert_eq!(result.total_credits, carbon_total + bio_total);
 
@@ -1492,7 +1552,10 @@ mod test {
 
         t.client.claim_credits(&holder, &bond_id, &0);
         assert_eq!(t.client.claimable_credits(&bond_id, &holder), 0);
-        assert_eq!(t.client.claimable_credit_details(&bond_id, &holder).len(), 0);
+        assert_eq!(
+            t.client.claimable_credit_details(&bond_id, &holder).len(),
+            0
+        );
     }
 
     #[test]
@@ -1615,14 +1678,17 @@ mod test {
 
         let total = 100 * CREDIT_MINOR_UNITS;
         let credits_per_token = total * FIXED_POINT / 3;
-        let per_holder = credits_per_token * 1 / FIXED_POINT;
+        let per_holder = credits_per_token / FIXED_POINT; // each holder holds 1 token
         let distributed = per_holder * 3;
         assert_eq!(result.total_credits, distributed);
 
         let period_info = t.client.get_period_info(&bond_id, &0);
         assert_eq!(period_info.undistributed, total - distributed);
 
-        assert_eq!(t.client.get_undistributed_total(&bond_id), total - distributed);
+        assert_eq!(
+            t.client.get_undistributed_total(&bond_id),
+            total - distributed
+        );
 
         let swept = t.client.sweep_undistributed(&t.admin, &bond_id, &2);
         assert_eq!(swept, total - distributed);
@@ -1775,6 +1841,111 @@ mod test {
         assert_eq!(result, Err(Ok(BondError::InvalidNonce)));
     }
 
+    #[test]
+    fn test_consume_credits_debits_ledgers_oldest_first() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let t = deploy(env.clone(), admin);
+        let project_id = create_project_id(&env, 1);
+        let holder = Address::generate(&env);
+        let bond_id = issue_and_subscribe(&env, &t, &project_id, &holder, 1_000);
+        t.client.register_bond(&t.admin, &bond_id, &project_id, &0);
+        let holders = vec![&env, holder.clone()];
+
+        // Two periods: 10 credits then 20 credits, all to one holder.
+        let report_0 = submit_verified_report(
+            &env,
+            &t,
+            &project_id,
+            10_000,
+            BiodiversityMetrics::Absent,
+            0,
+        );
+        t.client
+            .distribute_coupon(&t.admin, &bond_id, &0, &holders, &report_0, &1);
+        let report_1 = submit_verified_report(
+            &env,
+            &t,
+            &project_id,
+            20_000,
+            BiodiversityMetrics::Absent,
+            3,
+        );
+        t.client
+            .distribute_coupon(&t.admin, &bond_id, &1, &holders, &report_1, &2);
+        let period_0 = 10 * CREDIT_MINOR_UNITS;
+        let period_1 = 20 * CREDIT_MINOR_UNITS;
+        assert_eq!(
+            t.client.accrued_credits(&bond_id, &holder),
+            period_0 + period_1
+        );
+
+        // Consume more than period 0 holds: period 0 drains fully, period 1 partially.
+        let amount = period_0 + 5 * CREDIT_MINOR_UNITS;
+        t.client.consume_credits(&holder, &bond_id, &amount);
+        assert_eq!(
+            t.client.accrued_credits(&bond_id, &holder),
+            15 * CREDIT_MINOR_UNITS
+        );
+        assert_eq!(
+            t.client
+                .accrued_credits_by_type(&bond_id, &holder, &CreditType::Carbon),
+            15 * CREDIT_MINOR_UNITS
+        );
+        let details = t.client.claimable_credit_details(&bond_id, &holder);
+        assert_eq!(details.len(), 1);
+        assert_eq!(details.get(0).unwrap().period_index, 1);
+        assert_eq!(details.get(0).unwrap().amount, 15 * CREDIT_MINOR_UNITS);
+
+        // The rest can still be claimed, and only the rest.
+        assert_eq!(
+            t.client.claim_credits(&holder, &bond_id, &0),
+            15 * CREDIT_MINOR_UNITS
+        );
+        assert_eq!(t.client.accrued_credits(&bond_id, &holder), 0);
+    }
+
+    #[test]
+    fn test_consume_credits_rejects_zero_and_overdraw() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let t = deploy(env.clone(), admin);
+        let project_id = create_project_id(&env, 1);
+        let holder = Address::generate(&env);
+        let bond_id = issue_and_subscribe(&env, &t, &project_id, &holder, 1_000);
+        t.client.register_bond(&t.admin, &bond_id, &project_id, &0);
+        let report = submit_verified_report(
+            &env,
+            &t,
+            &project_id,
+            10_000,
+            BiodiversityMetrics::Absent,
+            0,
+        );
+        t.client.distribute_coupon(
+            &t.admin,
+            &bond_id,
+            &0,
+            &vec![&env, holder.clone()],
+            &report,
+            &1,
+        );
+        let accrued = t.client.accrued_credits(&bond_id, &holder);
+
+        assert_eq!(
+            t.client.try_consume_credits(&holder, &bond_id, &0),
+            Err(Ok(BondError::ZeroAmount))
+        );
+        assert_eq!(
+            t.client
+                .try_consume_credits(&holder, &bond_id, &(accrued + 1)),
+            Err(Ok(BondError::Overflow))
+        );
+        assert_eq!(t.client.accrued_credits(&bond_id, &holder), accrued);
+    }
+
     mod property {
         extern crate std;
 
@@ -1845,11 +2016,313 @@ mod test {
                 .sum()
         }
 
+        // ---- boundary-biased generators -----------------------------------
+        //
+        // Uniform ranges almost never land on the values where floor division
+        // and unit conversion misbehave, so every strategy below mixes a set of
+        // hand-picked edges with a uniform tail. Weights favour the edges.
+
+        /// Sequestration amounts around the whole-credit boundary
+        /// (`CREDIT_DIVISOR`), around zero, and a large realistic tail.
+        fn carbon_strategy() -> impl Strategy<Value = i128> {
+            prop_oneof![
+                3 => proptest::sample::select(std::vec![
+                    0,
+                    1,
+                    CREDIT_DIVISOR - 1,
+                    CREDIT_DIVISOR,
+                    CREDIT_DIVISOR + 1,
+                    2 * CREDIT_DIVISOR - 1,
+                    7 * CREDIT_DIVISOR + 999,
+                    1_000_000_000,
+                ]),
+                1 => 0i128..100_000_000i128,
+            ]
+        }
+
+        /// Holder balances biased toward 1, primes, and near-`FIXED_POINT`
+        /// multiples that stress the two-stage floor in `checked_ratio`.
+        fn balance_strategy() -> impl Strategy<Value = i128> {
+            prop_oneof![
+                3 => proptest::sample::select(std::vec![1, 2, 3, 7, 9, 11, 999, 1_000, 9_999]),
+                1 => 1i128..10_000i128,
+            ]
+        }
+
+        fn balances_strategy() -> impl Strategy<Value = std::vec::Vec<i128>> {
+            proptest::collection::vec(balance_strategy(), 1..6)
+        }
+
+        /// Supply that is issued but never subscribed. Zero is the common case;
+        /// the rest checks that unsubscribed tokens earn nothing and do not
+        /// dilute subscribers.
+        fn unsubscribed_strategy() -> impl Strategy<Value = i128> {
+            proptest::sample::select(std::vec![0, 0, 0, 1, 9, 1_000])
+        }
+
+        fn credit_type_strategy() -> impl Strategy<Value = CreditType> {
+            proptest::sample::select(std::vec![
+                CreditType::Carbon,
+                CreditType::BlueCarbon,
+                CreditType::Biodiversity,
+                CreditType::Basket,
+            ])
+        }
+
+        /// Biodiversity metrics: absent, all-zero, single-unit, and mixed
+        /// values, so both the "present but worthless" and the additive cases
+        /// are exercised for every bond type.
+        fn biodiversity_strategy() -> impl Strategy<Value = BiodiversityMetrics> {
+            let component = proptest::sample::select(std::vec![0i128, 1, 9, 10, 999, 1_000]);
+            prop_oneof![
+                1 => Just(BiodiversityMetrics::Absent),
+                1 => Just(BiodiversityMetrics::Present((0, 0, 0))),
+                3 => (component.clone(), component.clone(), component)
+                    .prop_map(BiodiversityMetrics::Present),
+            ]
+        }
+
+        /// Mirrors `compute_biodiversity_credits` for in-range inputs.
+        fn expected_biodiversity(metrics: BiodiversityMetrics) -> i128 {
+            match metrics {
+                BiodiversityMetrics::Absent => 0,
+                BiodiversityMetrics::Present((habitat, species, units)) => {
+                    habitat * HABITAT_CREDIT_RATE
+                        + species * SPECIES_CREDIT_RATE
+                        + units * UNIT_CREDIT_RATE
+                }
+            }
+        }
+
+        /// What `distribute_coupon` should mint for a report, per credit type,
+        /// or `None` when it must reject the report as invalid for the type.
+        fn expected_pool(
+            credit_type: CreditType,
+            carbon: i128,
+            metrics: BiodiversityMetrics,
+        ) -> Option<(i128, i128)> {
+            let carbon_pool = carbon / CREDIT_DIVISOR * CREDIT_MINOR_UNITS;
+            match (credit_type, metrics) {
+                (CreditType::Carbon | CreditType::BlueCarbon, _) => Some((carbon_pool, 0)),
+                (_, BiodiversityMetrics::Absent) => None,
+                (CreditType::Biodiversity, m) => Some((0, expected_biodiversity(m))),
+                (CreditType::Basket, m) => Some((carbon_pool, expected_biodiversity(m))),
+            }
+        }
+
+        fn deploy_typed(
+            env: Env,
+            admin: Address,
+            credit_type: CreditType,
+            balances: &[i128],
+            unsubscribed: i128,
+        ) -> (TestEnv, std::vec::Vec<Address>, u64, i128) {
+            let t = deploy(env, admin);
+            let project_id = create_project_id(&t._env, 7);
+            let total_subscribed: i128 = balances.iter().sum();
+
+            let issuer = nbbs_bond_issuer::BondIssuerClient::new(&t._env, &t.issuer_id);
+            let mut config = make_bond_config_with_type(&t._env, &project_id, credit_type);
+            config.total_supply = total_subscribed + unsubscribed;
+            let bond_id = issuer.issue_bond(&t.issuer_admin, &config, &0);
+
+            let holders: std::vec::Vec<Address> = balances
+                .iter()
+                .map(|_| Address::generate(&t._env))
+                .collect();
+            for (holder, &amount) in holders.iter().zip(balances.iter()) {
+                issuer.subscribe(holder, &bond_id, &amount, &0);
+            }
+
+            t.client.register_bond(&t.admin, &bond_id, &project_id, &0);
+            (t, holders, bond_id, total_subscribed)
+        }
+
         proptest! {
             #![proptest_config(ProptestConfig {
                 cases: 128,
                 ..ProptestConfig::default()
             })]
+
+            // Every credit type, every biodiversity shape, boundary-biased
+            // amounts and balances, with and without unsubscribed supply. The
+            // invariants below are the executable form of the coupon-math
+            // guarantees in docs/coupon-math-invariants.md.
+            #[test]
+            fn typed_distribution_invariants(
+                credit_type in credit_type_strategy(),
+                carbon in carbon_strategy(),
+                metrics in biodiversity_strategy(),
+                balances in balances_strategy(),
+                unsubscribed in unsubscribed_strategy(),
+            ) {
+                let env = Env::default();
+                env.mock_all_auths();
+                let admin = Address::generate(&env);
+                let (t, holders, bond_id, total_subscribed) =
+                    deploy_typed(env, admin, credit_type, &balances, unsubscribed);
+                let report_id = submit_verified_report(
+                    &t._env,
+                    &t,
+                    &create_project_id(&t._env, 7),
+                    carbon,
+                    metrics,
+                    0,
+                );
+
+                let mut holders_vec: Vec<Address> = Vec::new(&t._env);
+                for h in &holders {
+                    holders_vec.push_back(h.clone());
+                }
+
+                let outcome = t.client.try_distribute_coupon(
+                    &t.admin,
+                    &bond_id,
+                    &0,
+                    &holders_vec,
+                    &report_id,
+                    &1,
+                );
+
+                // I0: a report without the metrics the bond pays on is rejected,
+                // and rejection leaves no partial state behind.
+                let Some((carbon_pool, bio_pool)) = expected_pool(credit_type, carbon, metrics) else {
+                    prop_assert_eq!(outcome, Err(Ok(BondError::InvalidReport)));
+                    prop_assert_eq!(t.client.get_period_count(&bond_id), 0);
+                    prop_assert_eq!(t.client.get_undistributed_total(&bond_id), 0);
+                    for h in &holders {
+                        prop_assert_eq!(t.client.accrued_credits(&bond_id, h), 0);
+                    }
+                    return Ok(());
+                };
+                let result = outcome.unwrap().unwrap();
+                let pool = carbon_pool + bio_pool;
+
+                // I1: conservation. Distributed plus dust equals the pool, and
+                // the reported total is exactly the distributed subtotal.
+                let mut distributed = 0i128;
+                let mut credited = 0u32;
+                for h in &holders {
+                    let accrued = t.client.accrued_credits(&bond_id, h);
+                    prop_assert!(accrued >= 0);
+                    distributed += accrued;
+                    if accrued > 0 {
+                        credited += 1;
+                    }
+                }
+                let dust = t.client.get_undistributed_total(&bond_id);
+                prop_assert_eq!(distributed + dust, pool);
+                prop_assert_eq!(result.total_credits, distributed);
+                prop_assert_eq!(result.holder_count, credited);
+
+                // I2: dust is bounded by the number of floors taken: one per
+                // holder for a single-type bond, two for a basket, plus one for
+                // the credits-per-token floor.
+                let floors = if credit_type == CreditType::Basket { 2 } else { 1 };
+                prop_assert!(dust <= floors * (balances.len() as i128 + 1));
+
+                // I3: no holder is paid more than their exact pro-rata share of
+                // the pool over *subscribed* tokens, and unsubscribed supply
+                // does not dilute anyone.
+                for (h, &balance) in holders.iter().zip(balances.iter()) {
+                    let accrued = t.client.accrued_credits(&bond_id, h);
+                    prop_assert!(accrued <= pool * balance / total_subscribed);
+                    let by_type = t.client.accrued_credits_by_type(&bond_id, h, &CreditType::Carbon)
+                        + t.client.accrued_credits_by_type(&bond_id, h, &CreditType::Biodiversity);
+                    prop_assert_eq!(by_type, accrued);
+                }
+
+                // I4: monotone and fair. A larger balance never earns less, and
+                // equal balances earn exactly the same.
+                for (i, &bi) in balances.iter().enumerate() {
+                    for (j, &bj) in balances.iter().enumerate() {
+                        let ai = t.client.accrued_credits(&bond_id, &holders[i]);
+                        let aj = t.client.accrued_credits(&bond_id, &holders[j]);
+                        if bi > bj {
+                            prop_assert!(ai >= aj);
+                        } else if bi == bj {
+                            prop_assert_eq!(ai, aj);
+                        }
+                    }
+                }
+
+                // I5: type routing. Carbon-only bonds never accrue biodiversity
+                // credits, biodiversity-only bonds never accrue carbon, and a
+                // basket splits the two pools independently.
+                let mut carbon_seen = 0i128;
+                let mut bio_seen = 0i128;
+                for h in &holders {
+                    carbon_seen += t.client.accrued_credits_by_type(&bond_id, h, &CreditType::Carbon);
+                    bio_seen += t.client.accrued_credits_by_type(&bond_id, h, &CreditType::Biodiversity);
+                }
+                prop_assert!(carbon_seen <= carbon_pool);
+                prop_assert!(bio_seen <= bio_pool);
+                if carbon_pool == 0 {
+                    prop_assert_eq!(carbon_seen, 0);
+                }
+                if bio_pool == 0 {
+                    prop_assert_eq!(bio_seen, 0);
+                }
+
+                // I6: the period is closed exactly once and cannot be replayed.
+                prop_assert_eq!(t.client.get_period_count(&bond_id), 1);
+                prop_assert!(t
+                    .client
+                    .try_distribute_coupon(&t.admin, &bond_id, &0, &holders_vec, &report_id, &2)
+                    .is_err());
+            }
+
+            // Sub-credit sequestration is truncated at the report level, before
+            // scaling to minor units: a report below CREDIT_DIVISOR mints
+            // nothing, and the remainder is never carried to the next period.
+            #[test]
+            fn whole_credit_truncation_is_per_report(
+                remainder in 0i128..CREDIT_DIVISOR,
+                whole in 0i128..1_000i128,
+            ) {
+                let carbon = whole * CREDIT_DIVISOR + remainder;
+                let env = Env::default();
+                env.mock_all_auths();
+                let admin = Address::generate(&env);
+                let (t, holders, bond_id, _) =
+                    deploy_typed(env, admin, CreditType::Carbon, &[1], 0);
+                let report_id = submit_verified_report(
+                    &t._env,
+                    &t,
+                    &create_project_id(&t._env, 7),
+                    carbon,
+                    BiodiversityMetrics::Absent,
+                    0,
+                );
+                let holders_vec = soroban_sdk::vec![&t._env, holders[0].clone()];
+                let result = t.client.distribute_coupon(&t.admin, &bond_id, &0, &holders_vec, &report_id, &1);
+
+                prop_assert_eq!(result.total_credits, whole * CREDIT_MINOR_UNITS);
+                prop_assert_eq!(t.client.get_undistributed_total(&bond_id), 0);
+            }
+
+            // Pure helper property: within the range the oracle accepts and the
+            // engine can pay out, biodiversity credits are exactly additive in
+            // their three components. Larger inputs saturate inside the helper
+            // but are always rejected downstream by checked_ratio (Overflow).
+            #[test]
+            fn biodiversity_credits_are_additive(
+                habitat in 0i128..1_000_000i128,
+                species in 0i128..1_000_000i128,
+                units in 0i128..1_000_000i128,
+            ) {
+                let metrics = BiodiversityMetrics::Present((habitat, species, units));
+                prop_assert_eq!(
+                    compute_biodiversity_credits(&metrics),
+                    expected_biodiversity(metrics)
+                );
+                prop_assert_eq!(
+                    compute_biodiversity_credits(&BiodiversityMetrics::Present((habitat, 0, 0)))
+                        + compute_biodiversity_credits(&BiodiversityMetrics::Present((0, species, 0)))
+                        + compute_biodiversity_credits(&BiodiversityMetrics::Present((0, 0, units))),
+                    compute_biodiversity_credits(&metrics)
+                );
+            }
 
             // Pure pro-rata math: floor-based distribution never allocates more
             // than the available credits and leaves a non-negative remainder that

@@ -88,7 +88,10 @@ pub fn generate_storage_fixtures(
     let path = make_project_id(env, 1);
 
     let mut bond_issuer: BTreeMap<String, StorageKeyFixture> = BTreeMap::new();
-    bond_issuer.insert("Admin".to_string(), fx("Admin", encode(env, BondIssuerKey::Admin)));
+    bond_issuer.insert(
+        "Admin".to_string(),
+        fx("Admin", encode(env, BondIssuerKey::Admin)),
+    );
     bond_issuer.insert(
         "BondConfig(1)".to_string(),
         fx("BondConfig(1)", encode(env, BondIssuerKey::BondConfig(1))),
@@ -106,7 +109,10 @@ pub fn generate_storage_fixtures(
     );
     bond_issuer.insert(
         "RedemptionPool(1)".to_string(),
-        fx("RedemptionPool(1)", encode(env, BondIssuerKey::RedemptionPool(1))),
+        fx(
+            "RedemptionPool(1)",
+            encode(env, BondIssuerKey::RedemptionPool(1)),
+        ),
     );
     bond_issuer.insert(
         "BondCount".to_string(),
@@ -121,12 +127,18 @@ pub fn generate_storage_fixtures(
     );
     bond_issuer.insert(
         "ProjectRegistry".to_string(),
-        fx("ProjectRegistry", encode(env, BondIssuerKey::ProjectRegistry)),
+        fx(
+            "ProjectRegistry",
+            encode(env, BondIssuerKey::ProjectRegistry),
+        ),
     );
     contracts.insert("bond-issuer".to_string(), bond_issuer);
 
     let mut coupon_engine: BTreeMap<String, StorageKeyFixture> = BTreeMap::new();
-    coupon_engine.insert("Admin".to_string(), fx("Admin", encode(env, CouponEngineKey::Admin)));
+    coupon_engine.insert(
+        "Admin".to_string(),
+        fx("Admin", encode(env, CouponEngineKey::Admin)),
+    );
     coupon_engine.insert(
         "PeriodInfo(1, 1)".to_string(),
         fx(
@@ -143,7 +155,10 @@ pub fn generate_storage_fixtures(
     );
     coupon_engine.insert(
         "PeriodCount(1)".to_string(),
-        fx("PeriodCount(1)", encode(env, CouponEngineKey::PeriodCount(1))),
+        fx(
+            "PeriodCount(1)",
+            encode(env, CouponEngineKey::PeriodCount(1)),
+        ),
     );
     coupon_engine.insert(
         "AccruedCredits(1, addr)".to_string(),
@@ -156,16 +171,18 @@ pub fn generate_storage_fixtures(
         "AccruedCreditsByType(1, addr, Carbon)".to_string(),
         fx(
             "AccruedCreditsByType(1, addr, Carbon)",
-            encode(env, CouponEngineKey::AccruedCreditsByType(
-                1,
-                addr.clone(),
-                CreditType::Carbon,
-            )),
+            encode(
+                env,
+                CouponEngineKey::AccruedCreditsByType(1, addr.clone(), CreditType::Carbon),
+            ),
         ),
     );
     coupon_engine.insert(
         "BondProject(1)".to_string(),
-        fx("BondProject(1)", encode(env, CouponEngineKey::BondProject(1))),
+        fx(
+            "BondProject(1)",
+            encode(env, CouponEngineKey::BondProject(1)),
+        ),
     );
     coupon_engine.insert(
         "BondCreditType(1)".to_string(),
@@ -181,14 +198,23 @@ pub fn generate_storage_fixtures(
             encode(env, CouponEngineKey::UndistributedTotal(1)),
         ),
     );
-    coupon_engine.insert("Precision".to_string(), fx("Precision", encode(env, CouponEngineKey::Precision)));
+    coupon_engine.insert(
+        "Precision".to_string(),
+        fx("Precision", encode(env, CouponEngineKey::Precision)),
+    );
     coupon_engine.insert(
         "BondIssuerAddress".to_string(),
-        fx("BondIssuerAddress", encode(env, CouponEngineKey::BondIssuerAddress)),
+        fx(
+            "BondIssuerAddress",
+            encode(env, CouponEngineKey::BondIssuerAddress),
+        ),
     );
     coupon_engine.insert(
         "OracleConsumerAddress".to_string(),
-        fx("OracleConsumerAddress", encode(env, CouponEngineKey::OracleConsumerAddress)),
+        fx(
+            "OracleConsumerAddress",
+            encode(env, CouponEngineKey::OracleConsumerAddress),
+        ),
     );
     coupon_engine.insert(
         "Nonce(addr)".to_string(),
@@ -201,12 +227,10 @@ pub fn generate_storage_fixtures(
         "PeriodHolder(1, 1, addr, BlueCarbon)".to_string(),
         fx(
             "PeriodHolder(1, 1, addr, BlueCarbon)",
-            encode(env, CouponEngineKey::PeriodHolder(
-                1,
-                1,
-                addr.clone(),
-                CreditType::BlueCarbon,
-            )),
+            encode(
+                env,
+                CouponEngineKey::PeriodHolder(1, 1, addr.clone(), CreditType::BlueCarbon),
+            ),
         ),
     );
     contracts.insert("coupon-engine".to_string(), coupon_engine);
@@ -218,11 +242,17 @@ pub fn generate_storage_fixtures(
     );
     credit_retirement.insert(
         "Retirement(1)".to_string(),
-        fx("Retirement(1)", encode(env, CreditRetirementKey::Retirement(1))),
+        fx(
+            "Retirement(1)",
+            encode(env, CreditRetirementKey::Retirement(1)),
+        ),
     );
     credit_retirement.insert(
         "RetirementCount".to_string(),
-        fx("RetirementCount", encode(env, CreditRetirementKey::RetirementCount)),
+        fx(
+            "RetirementCount",
+            encode(env, CreditRetirementKey::RetirementCount),
+        ),
     );
     credit_retirement.insert(
         "HolderRetirements(addr)".to_string(),
@@ -269,7 +299,10 @@ pub fn generate_storage_fixtures(
     contracts.insert("credit-retirement".to_string(), credit_retirement);
 
     let mut dex_router: BTreeMap<String, StorageKeyFixture> = BTreeMap::new();
-    dex_router.insert("Admin".to_string(), fx("Admin", encode(env, DEXRouterKey::Admin)));
+    dex_router.insert(
+        "Admin".to_string(),
+        fx("Admin", encode(env, DEXRouterKey::Admin)),
+    );
     dex_router.insert(
         "Order(1)".to_string(),
         fx("Order(1)", encode(env, DEXRouterKey::Order(1))),
@@ -291,7 +324,10 @@ pub fn generate_storage_fixtures(
     );
     dex_router.insert(
         "BondIssuerAddress".to_string(),
-        fx("BondIssuerAddress", encode(env, DEXRouterKey::BondIssuerAddress)),
+        fx(
+            "BondIssuerAddress",
+            encode(env, DEXRouterKey::BondIssuerAddress),
+        ),
     );
     dex_router.insert(
         "CouponEngineAddress".to_string(),
@@ -304,7 +340,10 @@ pub fn generate_storage_fixtures(
         "Balance(COUPON, addr)".to_string(),
         fx(
             "Balance(COUPON, addr)",
-            encode(env, DEXRouterKey::Balance(Symbol::new(env, "COUPON"), addr.clone())),
+            encode(
+                env,
+                DEXRouterKey::Balance(Symbol::new(env, "COUPON"), addr.clone()),
+            ),
         ),
     );
     dex_router.insert(
@@ -324,14 +363,20 @@ pub fn generate_storage_fixtures(
     contracts.insert("dex-router".to_string(), dex_router);
 
     let mut governance: BTreeMap<String, StorageKeyFixture> = BTreeMap::new();
-    governance.insert("Signers".to_string(), fx("Signers", encode(env, GovernanceKey::Signers)));
+    governance.insert(
+        "Signers".to_string(),
+        fx("Signers", encode(env, GovernanceKey::Signers)),
+    );
     governance.insert(
         "Threshold".to_string(),
         fx("Threshold", encode(env, GovernanceKey::Threshold)),
     );
     governance.insert(
         "TimelockSeconds".to_string(),
-        fx("TimelockSeconds", encode(env, GovernanceKey::TimelockSeconds)),
+        fx(
+            "TimelockSeconds",
+            encode(env, GovernanceKey::TimelockSeconds),
+        ),
     );
     governance.insert(
         "Proposal(1)".to_string(),
@@ -366,7 +411,10 @@ pub fn generate_storage_fixtures(
         "AllowList(addr, COUPON)".to_string(),
         fx(
             "AllowList(addr, COUPON)",
-            encode(env, GovernanceKey::AllowList(addr.clone(), Symbol::new(env, "COUPON"))),
+            encode(
+                env,
+                GovernanceKey::AllowList(addr.clone(), Symbol::new(env, "COUPON")),
+            ),
         ),
     );
     contracts.insert("governance".to_string(), governance);
@@ -485,11 +533,17 @@ pub fn generate_storage_fixtures(
     );
     project_registry.insert(
         "ProjectCount".to_string(),
-        fx("ProjectCount", encode(env, ProjectRegistryKey::ProjectCount)),
+        fx(
+            "ProjectCount",
+            encode(env, ProjectRegistryKey::ProjectCount),
+        ),
     );
     project_registry.insert(
         "ProjectId(1)".to_string(),
-        fx("ProjectId(1)", encode(env, ProjectRegistryKey::ProjectId(1))),
+        fx(
+            "ProjectId(1)",
+            encode(env, ProjectRegistryKey::ProjectId(1)),
+        ),
     );
     project_registry.insert(
         "Nonce(addr)".to_string(),

@@ -26,12 +26,16 @@ pub struct BondState {
     pub created_at: u64,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 #[contracttype]
 pub struct PreviewSubscription {
     pub remaining_supply: i128,
     pub requested_amount: i128,
-    pub expected_failure: Option<BondError>,
+    /// Discriminant of the `BondError` the caller would hit, if any.
+    /// Held as the raw code rather than `Option<BondError>`: `#[contracterror]`
+    /// types do not implement `SorobanArbitrary`, so embedding one in a
+    /// `#[contracttype]` fails to compile once `testutils` is enabled.
+    pub expected_failure: Option<u32>,
 }
 
 fn require_admin(env: &Env, caller: &Address) -> Result<(), BondError> {
@@ -108,8 +112,10 @@ impl BondIssuer {
         env: Env,
         current_admin: Address,
         new_admin: Address,
+        nonce: u64,
     ) -> Result<(), BondError> {
         current_admin.require_auth();
+        consume_nonce(&env, &current_admin, nonce)?;
         require_admin(&env, &current_admin)?;
         env.storage().instance().set(&DataKey::Admin, &new_admin);
         env.events().publish(
@@ -613,6 +619,63 @@ impl BondIssuer {
 
         Ok(())
     }
+    /// Dry run of `subscribe` for `amount` units of `bond_id`.
+    ///
+    /// Read-only: no authorization is required and no nonce is consumed. Walks
+    /// the same checks as `subscribe`, in the same order, and reports the
+    /// first one that would fail as `expected_failure` instead of returning an
+    /// error, so callers can size an order before paying for a transaction.
+    /// Only an unknown bond is an error, since there is nothing to preview.
+    /// The per-holder balance overflow check in `subscribe` is not modelled
+    /// because the preview has no investor.
+    /// Dry run of `subscribe` for `amount` units of `bond_id`.
+    ///
+    /// Read-only: no authorization is required and no nonce is consumed. Walks
+    /// the same checks as `subscribe`, in the same order, and reports the
+    /// first one that would fail as `expected_failure` instead of returning an
+    /// error, so callers can size an order before paying for a transaction.
+    /// Only an unknown bond is an error, since there is nothing to preview.
+    /// The per-holder balance overflow check in `subscribe` is not modelled
+    /// because the preview has no investor.
+    pub fn preview_subscribe(
+        env: Env,
+        bond_id: u64,
+        amount: i128,
+    ) -> Result<PreviewSubscription, BondError> {
+        let config: BondConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::BondConfig(bond_id))
+            .ok_or(BondError::BondNotFound)?;
+
+        let state: BondState = env
+            .storage()
+            .instance()
+            .get(&DataKey::BondState(bond_id))
+            .ok_or(BondError::BondNotFound)?;
+
+        let expected_failure = if amount <= 0 {
+            Some(BondError::ZeroAmount as u32)
+        } else if state.status != BondStatus::Active
+            || env.ledger().timestamp() >= config.maturity_date
+        {
+            Some(BondError::BondAlreadyMatured as u32)
+        } else {
+            match state.total_subscribed.checked_add(amount) {
+                None => Some(BondError::Overflow as u32),
+                Some(new_total) if new_total > config.total_supply => {
+                    Some(BondError::InsufficientSupply as u32)
+                }
+                Some(_) => None,
+            }
+        };
+
+        Ok(PreviewSubscription {
+            remaining_supply: config.total_supply - state.total_subscribed,
+            requested_amount: amount,
+            expected_failure,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -715,11 +778,15 @@ mod test {
         let new_admin = Address::generate(&env);
         let config = make_config(&env);
 
-        client.set_admin(&admin, &new_admin);
+        assert_eq!(
+            client.try_set_admin(&admin, &new_admin, &1),
+            Err(Ok(BondError::InvalidNonce))
+        );
+        client.set_admin(&admin, &new_admin, &0);
         assert_eq!(client.get_admin(), new_admin);
 
         assert_eq!(
-            client.try_issue_bond(&admin, &config, &0),
+            client.try_issue_bond(&admin, &config, &1),
             Err(Ok(BondError::Unauthorized))
         );
         assert_eq!(client.issue_bond(&new_admin, &config, &0), 1);
@@ -1159,6 +1226,63 @@ mod test {
         assert_eq!(client.bond_count(), 2);
     }
 
+    #[test]
+    fn test_preview_subscribe_clean_order() {
+        let (env, client, admin, _user) = setup();
+        let bond_id = client.issue_bond(&admin, &make_config(&env), &0);
+
+        let preview = client.preview_subscribe(&bond_id, &100);
+        assert_eq!(preview.remaining_supply, 10000);
+        assert_eq!(preview.requested_amount, 100);
+        assert_eq!(preview.expected_failure, None);
+    }
+
+    #[test]
+    fn test_preview_subscribe_reports_each_failure() {
+        let (env, client, admin, user) = setup();
+        let config = make_config(&env);
+        let bond_id = client.issue_bond(&admin, &config, &0);
+
+        assert_eq!(
+            client.preview_subscribe(&bond_id, &0).expected_failure,
+            Some(BondError::ZeroAmount as u32)
+        );
+        assert_eq!(
+            client.preview_subscribe(&bond_id, &10001).expected_failure,
+            Some(BondError::InsufficientSupply as u32)
+        );
+
+        client.subscribe(&user, &bond_id, &4000, &0);
+        let preview = client.preview_subscribe(&bond_id, &6001);
+        assert_eq!(preview.remaining_supply, 6000);
+        assert_eq!(
+            preview.expected_failure,
+            Some(BondError::InsufficientSupply as u32)
+        );
+        assert_eq!(
+            client.preview_subscribe(&bond_id, &6000).expected_failure,
+            None
+        );
+
+        assert_eq!(
+            client
+                .preview_subscribe(&bond_id, &i128::MAX)
+                .expected_failure,
+            Some(BondError::Overflow as u32)
+        );
+
+        env.ledger().set_timestamp(config.maturity_date);
+        assert_eq!(
+            client.preview_subscribe(&bond_id, &1).expected_failure,
+            Some(BondError::BondAlreadyMatured as u32)
+        );
+
+        assert_eq!(
+            client.try_preview_subscribe(&99, &1),
+            Err(Ok(BondError::BondNotFound))
+        );
+    }
+
     mod property {
         extern crate std;
 
@@ -1175,6 +1299,45 @@ mod test {
             // and transfers the sum of holder balances always equals
             // total_subscribed, never exceeds total_supply, and each balance is
             // non-negative.
+            // The preview is only useful if it never lies: for any amount, the
+            // failure it predicts is exactly what subscribe then returns, and a
+            // clean preview is always followed by a successful subscription.
+            #[test]
+            fn preview_subscribe_agrees_with_subscribe(
+                supply in 1i128..100_000i128,
+                amounts in proptest::collection::vec(-100i128..60_000i128, 1..20),
+            ) {
+                let env = Env::default();
+                env.mock_all_auths();
+                let admin = Address::generate(&env);
+                let user = Address::generate(&env);
+                let contract_id = env.register(BondIssuer, (&admin,));
+                let client = BondIssuerClient::new(&env, &contract_id);
+
+                let mut config = make_config(&env);
+                config.total_supply = supply;
+                let bond_id = client.issue_bond(&admin, &config, &0);
+
+                let mut nonce = 0u64;
+                let mut total_subscribed = 0i128;
+                for amount in amounts {
+                    let preview = client.preview_subscribe(&bond_id, &amount);
+                    prop_assert_eq!(preview.remaining_supply, supply - total_subscribed);
+                    prop_assert_eq!(preview.requested_amount, amount);
+
+                    let actual = match client.try_subscribe(&user, &bond_id, &amount, &nonce) {
+                        Ok(_) => {
+                            nonce += 1;
+                            total_subscribed += amount;
+                            None
+                        }
+                        Err(Ok(e)) => Some(e as u32),
+                        Err(Err(e)) => return Err(TestCaseError::fail(std::format!("{e:?}"))),
+                    };
+                    prop_assert_eq!(preview.expected_failure, actual);
+                }
+            }
+
             #[test]
             fn subscription_conserves_supply(
                 supply in 100i128..1_000_000i128,
@@ -1338,48 +1501,5 @@ mod test {
                 prop_assert_eq!(client.total_subscribed(&bond_id), total_subscribed);
             }
         }
-    }
-
-    pub fn preview_subscribe(
-        env: Env,
-        bond_id: u64,
-        amount: i128,
-    ) -> Result<PreviewSubscription, BondError> {
-        investor.require_auth();
-
-        let config: BondConfig = env
-            .storage()
-            .instance()
-            .get(&DataKey::BondConfig(bond_id))
-            .ok_or(BondError::BondNotFound)?;
-
-        let mut state: BondState = env
-            .storage()
-            .instance()
-            .get(&DataKey::BondState(bond_id))
-            .ok_or(BondError::BondNotFound)?;
-
-        if state.status != BondStatus::Active {
-            return Err(BondError::BondAlreadyMatured);
-        }
-
-        if env.ledger().timestamp() >= config.maturity_date {
-            return Err(BondError::BondAlreadyMatured);
-        }
-
-        if amount <= 0 {
-            return Err(BondError::ZeroAmount);
-        }
-
-        let remaining_supply = config.total_supply - state.total_subscribed;
-        if amount > remaining_supply {
-            return Err(BondError::InsufficientSupply);
-        }
-
-        Ok(PreviewSubscription {
-            remaining_supply,
-            requested_amount: amount,
-            expected_failure: None,
-        })
     }
 }
