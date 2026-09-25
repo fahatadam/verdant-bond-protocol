@@ -28,8 +28,7 @@ import { PaginatedResponse } from '../common/dto/pagination.dto';
 import { toBigIntString } from '../common/utils';
 import { ConfigService } from '../config/config.service';
 import { normalizeQuoteAssetSymbol } from './quote-assets';
-
-
+import { HolderIndexService } from '../bonds/holder-index.service';
 
 const DEX_ERROR_CODE = {
   NotInitialized: 1,
@@ -54,6 +53,7 @@ export class DexService {
     private readonly redis: RedisService,
     private readonly signingKeys: SigningKeyProvider,
     private readonly configService: ConfigService,
+    private readonly holderIndexService: HolderIndexService,
   ) {}
 
   async listOrders(
@@ -162,6 +162,8 @@ export class DexService {
     } catch (error) {
       throw this.mapDexError(error);
     }
+
+    await this.holderIndexService.recordTransfer(order.bondId, order.seller, buyerAddress);
 
     await this.redis.invalidateTag('orders');
     await this.redis.invalidateTag('prices');

@@ -7,8 +7,10 @@ import { DexReconciliationService } from './dex.reconciliation.service';
 import { DexReconciliationScheduler } from './dex.reconciliation.scheduler';
 import { LiquidityService } from './liquidity.service';
 
+import { BondsModule } from '../bonds/bonds.module';
+
 @Module({
-  imports: [ScheduleModule.forRoot()],
+  imports: [ScheduleModule.forRoot(), BondsModule],
   controllers: [MarketplaceController],
   providers: [
     DexService,
