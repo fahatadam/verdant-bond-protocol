@@ -168,8 +168,20 @@ impl DEXRouter {
             .set(&DataKey::CouponEngineAddress, &coupon_engine_address);
     }
 
-    pub fn set_admin(env: Env, current_admin: Address, new_admin: Address) -> Result<(), DEXError> {
+    pub fn set_admin(
+        env: Env,
+        current_admin: Address,
+        new_admin: Address,
+        nonce: u64,
+    ) -> Result<(), DEXError> {
         current_admin.require_auth();
+
+        let expected_nonce = get_nonce(&env, &current_admin);
+        if nonce != expected_nonce {
+            return Err(DEXError::InvalidNonce);
+        }
+        set_nonce(&env, &current_admin, expected_nonce + 1);
+
         require_admin(&env, &current_admin)?;
         env.storage().instance().set(&DataKey::Admin, &new_admin);
         env.events().publish(

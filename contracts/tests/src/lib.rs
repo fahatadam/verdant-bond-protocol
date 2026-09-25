@@ -85,7 +85,7 @@ mod integration {
     /// 2-verifier threshold: the admin (consuming `admin_nonce`) plus a
     /// freshly registered, staked provider (consuming `admin_nonce + 1` to
     /// register). The admin's signature alone is not enough to finalize a
-    /// report — see "Multi-Source Verification Threshold" in
+    /// report; see "Multi-Source Verification Threshold" in
     /// docs/oracle-design.md.
     fn verify_with_quorum(
         env: &Env,
@@ -504,8 +504,6 @@ mod integration {
                 &Symbol::new(&env, "verra_vcs"),
                 &2,
             );
-            contracts.oc_client.add_stake(&oracle_b, &10_000i128, &0);
-
             contracts.oc_client.add_stake(&oracle_a, &100_000i128, &0);
             contracts.oc_client.add_stake(&oracle_b, &100_000i128, &0);
 
@@ -992,9 +990,6 @@ mod integration {
             let state = contracts.bi_client.get_bond_state(&bond_id);
             assert_eq!(state.status, nbbs_shared::BondStatus::Matured);
 
-            contracts
-                .bi_client
-                .fund_redemption(&admin, &bond_id, &2_000_000, &2);
             contracts.bi_client.redeem(&alice, &bond_id, &2_000, &1);
             assert_eq!(contracts.bi_client.get_holder_balance(&bond_id, &alice), 0);
         }
@@ -1059,9 +1054,9 @@ mod integration {
                 .distribute_coupon(&admin, &bond_id, &0, &holders, &report_id, &1);
 
             let total = 100 * nbbs_coupon_engine::CREDIT_MINOR_UNITS;
-            let credits_per_token =
-                total * nbbs_coupon_engine::FIXED_POINT / 3;
-            let per_holder = credits_per_token * 1 / nbbs_coupon_engine::FIXED_POINT;
+            let credits_per_token = total * nbbs_coupon_engine::FIXED_POINT / 3;
+            // each holder holds 1 token
+            let per_holder = credits_per_token / nbbs_coupon_engine::FIXED_POINT;
             let distributed = per_holder * 3;
 
             assert_eq!(result.total_credits, distributed);
@@ -1072,7 +1067,9 @@ mod integration {
                 total - distributed
             );
 
-            let swept = contracts.ce_client.sweep_undistributed(&admin, &bond_id, &2);
+            let swept = contracts
+                .ce_client
+                .sweep_undistributed(&admin, &bond_id, &2);
             assert_eq!(swept, total - distributed);
             assert_eq!(contracts.ce_client.get_undistributed_total(&bond_id), 0);
         }
@@ -1252,16 +1249,13 @@ mod integration {
                 * nbbs_coupon_engine::CREDIT_MINOR_UNITS
                 / nbbs_coupon_engine::HABITAT_CREDIT_RATE;
 
-            contracts.ce_client.register_bond(&admin, &bond_id, &project_id, &0);
+            contracts
+                .ce_client
+                .register_bond(&admin, &bond_id, &project_id, &0);
             let holders = soroban_sdk::vec![&env, holder.clone()];
-            contracts.ce_client.distribute_coupon(
-                &admin,
-                &bond_id,
-                &0,
-                &holders,
-                &report_0,
-                &1,
-            );
+            contracts
+                .ce_client
+                .distribute_coupon(&admin, &bond_id, &0, &holders, &report_0, &1);
 
             let report_1 = contracts.oc_client.submit_report(
                 &oracle,
@@ -1284,14 +1278,9 @@ mod integration {
                 / nbbs_coupon_engine::HABITAT_CREDIT_RATE;
 
             let holder_vec = soroban_sdk::vec![&env, holder.clone()];
-            contracts.ce_client.distribute_coupon(
-                &admin,
-                &bond_id,
-                &1,
-                &holder_vec,
-                &report_1,
-                &2,
-            );
+            contracts
+                .ce_client
+                .distribute_coupon(&admin, &bond_id, &1, &holder_vec, &report_1, &2);
 
             let expected_total = carbon_0 + bio_0 + carbon_1 + bio_1;
             assert_eq!(
@@ -1299,7 +1288,9 @@ mod integration {
                 expected_total
             );
 
-            let details = contracts.ce_client.claimable_credit_details(&bond_id, &holder);
+            let details = contracts
+                .ce_client
+                .claimable_credit_details(&bond_id, &holder);
             assert_eq!(details.len(), 4);
 
             let line = details.get(0).unwrap();
@@ -1334,7 +1325,10 @@ mod integration {
             assert_eq!(claimed, expected_total);
             assert_eq!(contracts.ce_client.claimable_credits(&bond_id, &holder), 0);
             assert_eq!(
-                contracts.ce_client.claimable_credit_details(&bond_id, &holder).len(),
+                contracts
+                    .ce_client
+                    .claimable_credit_details(&bond_id, &holder)
+                    .len(),
                 0
             );
         }
@@ -1354,9 +1348,112 @@ mod integration {
 
             assert_eq!(contracts.ce_client.claimable_credits(&bond_id, &holder), 0);
             assert_eq!(
-                contracts.ce_client.claimable_credit_details(&bond_id, &holder).len(),
+                contracts
+                    .ce_client
+                    .claimable_credit_details(&bond_id, &holder)
+                    .len(),
                 0
             );
+        }
+    }
+
+    mod governance {
+        use super::*;
+        use nbbs_governance::{Governance, GovernanceClient, DEFAULT_TIMELOCK_SECONDS};
+        use soroban_sdk::IntoVal;
+
+        // Role granting is governance-gated exactly when each contract's admin
+        // is the governance contract. This walks that configuration for every
+        // admin-bearing contract: hand the role to governance, then rotate it
+        // again only through a threshold-approved, timelocked proposal. It also
+        // pins the calling convention `execute` relies on: every admin method
+        // takes the caller first and a nonce last, `set_admin` included.
+        #[test]
+        fn test_governance_rotates_admin_on_every_contract() {
+            let env = Env::default();
+            env.mock_all_auths();
+            let admin = Address::generate(&env);
+            let contracts = deploy_contracts(&env, &admin);
+
+            let signers = soroban_sdk::vec![
+                &env,
+                Address::generate(&env),
+                Address::generate(&env),
+                Address::generate(&env)
+            ];
+            let threshold: u32 = 2;
+            let gov_addr = env.register(
+                Governance,
+                (&signers, &threshold, &DEFAULT_TIMELOCK_SECONDS),
+            );
+            let gov = GovernanceClient::new(&env, &gov_addr);
+            let method = Symbol::new(&env, "set_admin");
+            let proposer = signers.get(0).unwrap();
+            let voter = signers.get(1).unwrap();
+            let allower = signers.get(2).unwrap();
+
+            // Every contract's admin nonce is independent, so each hand-over is
+            // that admin's first call on that contract.
+            contracts.pr_client.set_admin(&admin, &gov_addr, &0);
+            contracts.bi_client.set_admin(&admin, &gov_addr, &0);
+            contracts.oc_client.set_admin(&admin, &gov_addr, &0);
+            contracts.ce_client.set_admin(&admin, &gov_addr, &0);
+            contracts.dr_client.set_admin(&admin, &gov_addr, &0);
+            contracts.cr_client.set_admin(&admin, &gov_addr, &0);
+
+            let targets = [
+                contracts.pr_client.address.clone(),
+                contracts.bi_client.address.clone(),
+                contracts.oc_client.address.clone(),
+                contracts.ce_client.address.clone(),
+                contracts.dr_client.address.clone(),
+                contracts.cr_client.address.clone(),
+            ];
+            let new_admin = Address::generate(&env);
+            let mut now = 0u64;
+            for (i, target) in targets.iter().enumerate() {
+                let i = i as u64;
+                gov.add_to_allow_list(&allower, target, &method, &(2 * i));
+                let proposal_id = gov.propose(
+                    &proposer,
+                    target,
+                    &method,
+                    &soroban_sdk::vec![&env, new_admin.clone().into_val(&env)],
+                    &Symbol::new(&env, "rotate"),
+                    &(2 * i),
+                );
+                gov.vote_approve(&voter, &proposal_id, &i);
+                // One vote short of the threshold: nothing may execute yet.
+                assert!(gov
+                    .try_execute(&proposer, &proposal_id, &(2 * i + 1))
+                    .is_err());
+                gov.vote_approve(&allower, &proposal_id, &(2 * i + 1));
+                // Queued, but the timelock has not elapsed.
+                assert!(gov
+                    .try_execute(&proposer, &proposal_id, &(2 * i + 1))
+                    .is_err());
+
+                now += DEFAULT_TIMELOCK_SECONDS;
+                env.ledger().set_timestamp(now);
+                gov.execute(&proposer, &proposal_id, &(2 * i + 1));
+            }
+
+            assert_eq!(contracts.pr_client.get_admin(), new_admin);
+            assert_eq!(contracts.bi_client.get_admin(), new_admin);
+            assert_eq!(contracts.oc_client.get_admin(), new_admin);
+            assert_eq!(contracts.ce_client.get_admin(), new_admin);
+            assert_eq!(contracts.dr_client.get_admin(), new_admin);
+            assert_eq!(contracts.cr_client.get_admin(), new_admin);
+
+            // Neither the original key nor governance itself holds the role now.
+            assert!(contracts
+                .bi_client
+                .try_set_admin(&admin, &Address::generate(&env), &1)
+                .is_err());
+            assert!(contracts
+                .bi_client
+                .try_set_admin(&gov_addr, &Address::generate(&env), &1)
+                .is_err());
         }
     }
 
@@ -1664,7 +1761,11 @@ mod integration {
 
             // Subscribe
             contracts.bi_client.subscribe(&bob, &bond_id, &3_000, &0);
-            contracts.bi_client.subscribe(&charlie, &bond_id, &6_000, &1); // 9_000 total subscribed out of 10_000
+            // 9_000 total subscribed out of 10_000. Nonces are per-address, so
+            // charlie's first call is 0 even though bob already subscribed.
+            contracts
+                .bi_client
+                .subscribe(&charlie, &bond_id, &6_000, &0);
 
             contracts.oc_client.register_provider(
                 &admin,
@@ -1687,83 +1788,140 @@ mod integration {
             );
             contracts.oc_client.verify_report(&admin, &report_id, &1);
 
-            contracts.ce_client.register_bond(&admin, &bond_id, &project_id, &0);
+            // DEFAULT_SIGNATURE_THRESHOLD is 2, so a second independently staked
+            // verifier is needed before the report reaches Verified and the coupon
+            // can be distributed.
+            let second_verifier = Address::generate(&env);
+            contracts.oc_client.register_provider(
+                &admin,
+                &second_verifier,
+                &Symbol::new(&env, "satellite"),
+                &2,
+            );
+            contracts.oc_client.add_stake(
+                &second_verifier,
+                &nbbs_oracle_consumer::DEFAULT_MIN_VERIFIER_STAKE,
+                &0,
+            );
+            contracts
+                .oc_client
+                .verify_report(&second_verifier, &report_id, &1);
+
+            contracts
+                .ce_client
+                .register_bond(&admin, &bond_id, &project_id, &0);
 
             let holders = soroban_sdk::vec![&env, bob.clone(), charlie.clone()];
-            let dist_result = contracts.ce_client.distribute_coupon(
-                &admin,
-                &bond_id,
-                &0,
-                &holders,
-                &report_id,
-                &1,
-            );
+            let dist_result = contracts
+                .ce_client
+                .distribute_coupon(&admin, &bond_id, &0, &holders, &report_id, &1);
 
-            let total_credits = 100i128; // 100_000 / 1000
-            assert_eq!(dist_result.total_credits, total_credits);
-            
+            // The credit pool is carbon / CREDIT_DIVISOR * CREDIT_MINOR_UNITS,
+            // i.e. 100_000 / 1_000 * 1_000_000.
+            let credit_pool = 100i128 * nbbs_coupon_engine::CREDIT_MINOR_UNITS;
+
+            // Holders split the pool by their share of *subscribed* tokens, not of
+            // total supply, so with 9_000 of 10_000 subscribed bob takes 3/9 and
+            // charlie 6/9. Both floor, leaving 1 minor unit of dust.
+            // `DistributionResult::total_credits` reports the amount actually
+            // distributed, not the pool, so it is the pool minus that dust.
+            assert_eq!(dist_result.total_credits, credit_pool - 1);
+
             let bob_accrued = contracts.ce_client.accrued_credits(&bond_id, &bob);
             let charlie_accrued = contracts.ce_client.accrued_credits(&bond_id, &charlie);
             let undistributed = contracts.ce_client.get_undistributed_total(&bond_id);
-            
-            assert_eq!(bob_accrued, 30);
-            assert_eq!(charlie_accrued, 60);
-            assert_eq!(undistributed, 10);
-            
-            // Invariant: Total = Accrued + Undistributed
-            assert_eq!(bob_accrued + charlie_accrued + undistributed, total_credits);
 
-            // Bob claims partial (10 credits)
-            let credit_hash_1 = make_ipfs_hash(&env, 42);
-            let retire_id_1 = contracts.cr_client.retire_credits(
+            assert_eq!(bob_accrued, 33_333_333);
+            assert_eq!(charlie_accrued, 66_666_666);
+            assert_eq!(undistributed, 1);
+
+            // Conservation invariant: every minor unit of the pool is either accrued
+            // to a holder or held as undistributed dust. Stated against the pool
+            // rather than `dist_result.total_credits`, which is the distributed
+            // subtotal and so already excludes the dust.
+            assert_eq!(bob_accrued + charlie_accrued + undistributed, credit_pool);
+            assert_eq!(bob_accrued + charlie_accrued, dist_result.total_credits);
+
+            // Bob retires 10 whole credits. Retirement settles against the
+            // coupon ledger, so his accrued balance drops by exactly that amount.
+            let ten_credits = 10 * nbbs_coupon_engine::CREDIT_MINOR_UNITS;
+            contracts.cr_client.retire_credits(
                 &bob,
                 &bond_id,
-                &10,
+                &ten_credits,
                 &CreditType::Carbon,
-                &credit_hash_1,
+                &make_ipfs_hash(&env, 42),
                 &0,
             );
-            
-            let bob_remaining = contracts.ce_client.accrued_credits(&bond_id, &bob);
-            assert_eq!(bob_remaining, 20);
-            
-            // Duplicate claim attempt / claiming more than accrued
-            let credit_hash_2 = make_ipfs_hash(&env, 43);
+            let bob_remaining = bob_accrued - ten_credits;
+            assert_eq!(
+                contracts.ce_client.accrued_credits(&bond_id, &bob),
+                bob_remaining
+            );
+            assert_eq!(contracts.cr_client.get_total_retired(&bob), ten_credits);
+
+            // Claiming one minor unit more than remains must fail. The contract
+            // returns Err, so the host rolls the frame back and bob's nonce is not
+            // consumed by the failed attempt.
             let res = contracts.cr_client.try_retire_credits(
                 &bob,
                 &bond_id,
-                &21, // tries to claim 21 but has 20
+                &(bob_remaining + 1),
                 &CreditType::Carbon,
-                &credit_hash_2,
+                &make_ipfs_hash(&env, 43),
                 &1,
             );
             assert!(res.is_err());
-            
-            // Admin sweeps
-            let swept = contracts.ce_client.sweep_undistributed(&admin, &bond_id, &2);
-            assert_eq!(swept, 10);
+
+            // Admin sweeps the rounding dust.
+            let swept = contracts
+                .ce_client
+                .sweep_undistributed(&admin, &bond_id, &2);
+            assert_eq!(swept, undistributed);
             assert_eq!(contracts.ce_client.get_undistributed_total(&bond_id), 0);
-            
-            // Post-sweep claim succeeds for accrued balances
-            let retire_id_2 = contracts.cr_client.retire_credits(
+
+            // Post-sweep retirement of the exact remainder succeeds, and bob is
+            // then fully retired: one more minor unit is refused.
+            contracts.cr_client.retire_credits(
                 &bob,
                 &bond_id,
-                &20,
+                &bob_remaining,
                 &CreditType::Carbon,
                 &make_ipfs_hash(&env, 44),
-                &2,
+                &1,
             );
-            assert_eq!(contracts.ce_client.accrued_credits(&bond_id, &bob), 0);
-            
-            // Final accounting check
             let bob_retired = contracts.cr_client.get_total_retired(&bob);
-            assert_eq!(bob_retired, 30);
-            let charlie_retired = contracts.cr_client.get_total_retired(&charlie); // 0
-            let charlie_remaining = contracts.ce_client.accrued_credits(&bond_id, &charlie); // 60
-            
+            assert_eq!(bob_retired, bob_accrued);
+            assert_eq!(contracts.ce_client.accrued_credits(&bond_id, &bob), 0);
+            assert!(contracts
+                .cr_client
+                .try_retire_credits(
+                    &bob,
+                    &bond_id,
+                    &1,
+                    &CreditType::Carbon,
+                    &make_ipfs_hash(&env, 45),
+                    &2,
+                )
+                .is_err());
+
+            // Retired credits cannot be claimed again: the double-spend path is closed.
+            assert_eq!(contracts.ce_client.claim_credits(&bob, &bond_id, &0), 0);
+
+            // Final accounting: every minor unit of the pool is retired, still
+            // accrued to a holder, or swept. Nothing is created or lost.
+            let charlie_retired = contracts.cr_client.get_total_retired(&charlie);
+            assert_eq!(charlie_retired, 0);
+            let charlie_remaining = contracts.ce_client.accrued_credits(&bond_id, &charlie);
+            assert_eq!(charlie_remaining, charlie_accrued);
+
             assert_eq!(
-                bob_retired + charlie_retired + charlie_remaining + swept + contracts.ce_client.get_undistributed_total(&bond_id),
-                total_credits
+                bob_retired
+                    + charlie_retired
+                    + charlie_remaining
+                    + swept
+                    + contracts.ce_client.get_undistributed_total(&bond_id),
+                credit_pool
             );
         }
     }

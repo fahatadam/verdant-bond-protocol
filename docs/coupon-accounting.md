@@ -18,8 +18,8 @@ Where:
 ## Lifecycle Invariants
 
 1. **Distribution**: When `distribute_coupon` runs, it pulls from `Undistributed` and adds to each holder's `Accrued` balance proportional to their bond holdings. The sum of all additions plus any remainder (due to rounding) precisely equals the amount deducted from `Undistributed`.
-2. **Claiming**: When a holder claims credits via `retire_credits`, their `Accrued` balance in the `CouponEngine` is reduced by exactly the claimed amount, and the `CreditRetirement` contract records the retirement. A holder can never claim more than their accrued balance. Duplicate claims fail deterministically.
+2. **Claiming**: When a holder claims credits via `retire_credits`, their `Accrued` balance in the `CouponEngine` is reduced by exactly the claimed amount (`CreditRetirement` invokes `CouponEngine.consume_credits` under the holder's authorization before it mints the certificate), and the `CreditRetirement` contract records the retirement. A holder can never claim more than their accrued balance, and credits retired this way are no longer claimable through `claim_credits`. Duplicate claims fail deterministically.
 3. **Sweeping**: `sweep_undistributed` allows the admin to recover any `Undistributed` credits. Once swept, these credits are removed from the `Undistributed` pool. Sweeping does not affect already `Accrued` balances; holders can still claim what they are owed. Post-sweep claims function normally for accrued balances.
 4. **Maturity**: After bond maturity, the fundamental conservation rule still holds. Late claims are permitted against previously accrued balances.
 
-These rules are verified on-chain and through cross-contract integration tests ensuring no edge case (such as zero-balance holders, partial distributions, or precision loss) can break the accounting.
+These rules are verified on-chain and through cross-contract integration tests ensuring no edge case (such as zero-balance holders, partial distributions, or precision loss) can break the accounting. The executable form of each rule, and the generators used to search for counterexamples, are described in coupon-math-invariants.md.
