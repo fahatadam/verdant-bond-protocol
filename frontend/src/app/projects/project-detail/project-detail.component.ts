@@ -160,7 +160,7 @@ export class ProjectDetailComponent implements OnInit {
   }
 
   onApprove(): void {
-    if (!confirm('Approve project #'' + this.project()?.id + '?')) return;
+    if (!confirm('Approve project #' + this.project()?.id + '?')) return;
     this.apiService.approveProject(this.project()!.id).subscribe({
       next: () => {
         this.loadProjects();
