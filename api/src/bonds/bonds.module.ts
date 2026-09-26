@@ -8,9 +8,7 @@ import { HolderIndexService } from './holder-index.service';
 @Module({
   imports: [OracleModule],
   controllers: [BondsController],
-  providers: [BondsService, HolderIndexService],
-  exports: [BondsService, HolderIndexService],
-  providers: [BondsService, BondReconciliationService],
-  exports: [BondsService, BondReconciliationService],
+  providers: [BondsService, HolderIndexService, BondReconciliationService],
+  exports: [BondsService, HolderIndexService, BondReconciliationService],
 })
 export class BondsModule {}
