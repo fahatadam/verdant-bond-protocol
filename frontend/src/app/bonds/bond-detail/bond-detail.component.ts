@@ -4,7 +4,6 @@ import { RouterModule, ActivatedRoute } from '@angular/router';
 import { FormsModule } from '@angular/forms';
 import { ApiService, CouponEligibility } from '../../shared/services/api.service';
 import { WalletService } from '../../auth/wallet.service';
-import { AuthService } from '../../auth/auth.service';
 import { StatusBadgeComponent } from '../../shared/components/status-badge/status-badge.component';
 import { LoadingSpinnerComponent } from '../../shared/components/loading-spinner/loading-spinner.component';
 import { BondDetailReloadCoordinator } from './bond-detail.reload-coordinator';
@@ -743,7 +742,7 @@ private submitSweep(): void {
     if (!confirmed) return;
 
     this.apiService.distributeCoupon(b.id, { periodIndex: 0 }).subscribe({
-      next: (res) => {
+      next: (_res) => {
         this.reload(b.id);
       },
       error: (err) => {
@@ -791,7 +790,7 @@ private submitSweep(): void {
 
     this.reconcileSubmitting.set(true);
     this.apiService.reconcileHolders(b.id).subscribe({
-      next: (res) => {
+      next: (_res) => {
         this.reload(b.id);
       },
       error: (err) => {
