@@ -18,6 +18,13 @@ import { TelemetryInterceptor } from './common/interceptors/telemetry.intercepto
 import { WorkersModule } from './workers/workers.module';
 import { ReconciliationModule } from './reconciliation/reconciliation.module';
 import { ExportsModule } from './exports/exports.module';
+import { ComplianceModule } from './compliance/compliance.module';
+import { AuditModule } from './audit/audit.module';
+import { RecoveryModule } from './recovery/recovery.module';
+import { MigrationSafetyModule } from './migrations/migration-safety.module';
+import { ImpersonationModule } from './impersonation/impersonation.module';
+import { InvitationsModule } from './invitations/invitations.module';
+import { FailuresModule } from './failures/failures.module';
 
 @Module({
   imports: [
@@ -34,6 +41,13 @@ import { ExportsModule } from './exports/exports.module';
     WorkersModule,
     ReconciliationModule,
     ExportsModule,
+    ComplianceModule,
+    AuditModule,
+    RecoveryModule,
+    MigrationSafetyModule,
+    ImpersonationModule,
+    InvitationsModule,
+    FailuresModule,
   ],
   providers: [
     { provide: APP_FILTER, useClass: Rfc7807ExceptionFilter },
