@@ -241,10 +241,10 @@ export class ApiService {
     }));
   }
 
-  mature(id: number): Observable<BondResponse> {
+  mature(id: number): Observable<Bond> {
     return this.withProblemDetails(defer(() => {
       const headers = this.headers(this.adminIntentHeader('mature_bond', String(id)));
-      return this.http.post<BondResponse>(
+      return this.http.post<Bond>(
         `/api/bonds/${id}/mature`,
         {},
         { headers },

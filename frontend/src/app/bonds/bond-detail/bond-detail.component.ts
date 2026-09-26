@@ -13,6 +13,8 @@ import { AdminAccessService } from '../../shared/services/admin-access.service';
 import { AdminIntentService } from '../../shared/services/admin-intent.service';
 import { Bond, ClaimableCreditsResponse } from '../../shared/interfaces/bond.interface';
 import { formatCreditMinorUnits } from '../../shared/utils/credit-format';
+import { appErrorMessage } from '../../shared/errors/api-error';
+import { PendingTransactionsService } from '../../shared/services/pending-transactions.service';
 
 @Component({
   selector: 'app-bond-detail',
@@ -446,6 +448,7 @@ export class BondDetailComponent implements OnInit, OnDestroy {
   private readonly adminAccess = inject(AdminAccessService);
   readonly adminIntent = inject(AdminIntentService);
   private readonly coordinator = inject(BondDetailReloadCoordinator);
+  private readonly pendingTx = inject(PendingTransactionsService);
 
   /**
    * Every panel (summary, holders, coupon, maturity) is derived from the single
