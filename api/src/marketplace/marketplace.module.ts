@@ -6,6 +6,7 @@ import { DexScheduler } from './dex.scheduler';
 import { DexReconciliationService } from './dex.reconciliation.service';
 import { DexReconciliationScheduler } from './dex.reconciliation.scheduler';
 import { LiquidityService } from './liquidity.service';
+import { OrderStateService } from './order-state.service';
 
 import { BondsModule } from '../bonds/bonds.module';
 
@@ -15,10 +16,11 @@ import { BondsModule } from '../bonds/bonds.module';
   providers: [
     DexService,
     LiquidityService,
+    OrderStateService,
     DexScheduler,
     DexReconciliationService,
     DexReconciliationScheduler,
   ],
-  exports: [DexService, LiquidityService, DexReconciliationService],
+  exports: [DexService, LiquidityService, DexReconciliationService, OrderStateService],
 })
 export class MarketplaceModule {}
