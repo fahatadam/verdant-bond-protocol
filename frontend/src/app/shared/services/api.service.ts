@@ -11,7 +11,7 @@ import {
   UndistributedTotalResponse, SweepUndistributedResponse,
   QuoteBalanceResponse, QuoteTransactionResponse,
   QuoteAsset, DepositQuoteDto, WithdrawQuoteDto, HolderResponse,
-  ClaimableCreditsResponse,
+  ClaimableCreditsResponse, CouponDistributionResponse, HolderListResponse,
 } from '../interfaces/bond.interface';
 
 export interface ProblemDetails {
@@ -411,5 +411,9 @@ export class ApiService {
     return this.withProblemDetails(
       this.http.get<BondDetailResponse>(`/api/bonds/${id}/detail`, { params }),
     );
+  }
+
+  getTransactionStatus(hash: string): Observable<{ status: 'pending' | 'success' | 'failed' }> {
+    return this.withProblemDetails(this.http.get<{ status: 'pending' | 'success' | 'failed' }>(`/api/stellar/transactions/${hash}`));
   }
 }
