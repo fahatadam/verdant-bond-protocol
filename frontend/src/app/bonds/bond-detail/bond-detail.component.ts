@@ -770,8 +770,10 @@ private submitSweep(): void {
     this.apiService.mature(b.id).subscribe({
       next: (res) => {
         this.matureSuccess.set(true);
-        this.matureTx.set(res.transactionHash);
-        this.pendingTx.register(res.transactionHash, 'mature');
+        this.matureTx.set(res.transactionHash || '');
+        if (res.transactionHash) {
+          this.pendingTx.register(res.transactionHash, 'mature');
+        }
         this.matureSubmitting.set(false);
         this.reload(b.id);
       },
