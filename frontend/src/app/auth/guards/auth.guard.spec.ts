@@ -45,7 +45,7 @@ describe('route guards (issue #168)', () => {
     wallet.address.set(null);
   });
 
-  const expectRedirect = (result: boolean | UrlTree | RedirectCommand, url: string, reason: string) => {
+  const expectRedirect = (result: any, url: string, reason: string) => {
     let tree: UrlTree;
     if (result instanceof RedirectCommand) {
       tree = result.redirectTo;
