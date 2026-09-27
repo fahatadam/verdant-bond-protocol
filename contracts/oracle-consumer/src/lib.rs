@@ -181,7 +181,6 @@ impl OracleConsumer {
         SCHEMA_VERSION
     }
 
-
     pub fn register_provider(
         env: Env,
         caller: Address,

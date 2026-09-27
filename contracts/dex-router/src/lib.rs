@@ -7,7 +7,6 @@ use soroban_sdk::{contract, contractimpl, contracttype, vec, Address, Env, IntoV
 /// layout or interface change; see docs/upgrade-migrations.md.
 pub const SCHEMA_VERSION: u32 = 1;
 
-
 #[derive(Clone)]
 #[contracttype]
 pub enum DataKey {
@@ -210,7 +209,6 @@ impl DEXRouter {
         let _ = env;
         SCHEMA_VERSION
     }
-
 
     pub fn get_nonce(env: Env, address: Address) -> u64 {
         get_nonce(&env, &address)

@@ -35,7 +35,6 @@ pub const TRAILING_HISTORY_PERIODS: u32 = 8;
 /// layout or interface change; see docs/upgrade-migrations.md.
 pub const SCHEMA_VERSION: u32 = 1;
 
-
 #[derive(Clone)]
 #[contracttype]
 pub enum DataKey {
@@ -142,7 +141,6 @@ pub struct MigrationWindow {
     pub snapshot_undistributed: i128,
     pub snapshot_period_count: u32,
 }
-
 
 #[contract]
 pub struct CouponEngine;
@@ -290,7 +288,11 @@ impl CouponEngine {
         // Issue #186: an active flag pauses automatic coupon distribution for
         // this bond until an admin clears it after dispute resolution — a
         // flagged update is never silently clamped.
-        if env.storage().instance().has(&DataKey::PerformanceFlag(bond_id)) {
+        if env
+            .storage()
+            .instance()
+            .has(&DataKey::PerformanceFlag(bond_id))
+        {
             return Err(BondError::PerformanceFlagged);
         }
 
@@ -919,7 +921,9 @@ impl CouponEngine {
     /// Issue #186: whether an out-of-bound performance update is currently
     /// pausing coupon distribution for this bond.
     pub fn is_performance_flagged(env: Env, bond_id: u64) -> bool {
-        env.storage().instance().has(&DataKey::PerformanceFlag(bond_id))
+        env.storage()
+            .instance()
+            .has(&DataKey::PerformanceFlag(bond_id))
     }
 
     /// Issue #186: details of the active performance flag, if any.
@@ -955,17 +959,19 @@ impl CouponEngine {
 
         require_admin(&env, &caller)?;
 
-        if !env.storage().instance().has(&DataKey::PerformanceFlag(bond_id)) {
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::PerformanceFlag(bond_id))
+        {
             return Err(BondError::BondNotFound);
         }
 
         env.storage()
             .instance()
             .remove(&DataKey::PerformanceFlag(bond_id));
-        env.events().publish(
-            (Symbol::new(&env, "performance_unflagged"),),
-            (bond_id,),
-        );
+        env.events()
+            .publish((Symbol::new(&env, "performance_unflagged"),), (bond_id,));
 
         Ok(())
     }
@@ -1023,10 +1029,8 @@ impl CouponEngine {
         env.storage()
             .instance()
             .set(&DataKey::MigrationWindow(bond_id), &window);
-        env.events().publish(
-            (Symbol::new(&env, "migration_started"),),
-            (bond_id,),
-        );
+        env.events()
+            .publish((Symbol::new(&env, "migration_started"),), (bond_id,));
 
         Ok(window)
     }
@@ -1060,10 +1064,8 @@ impl CouponEngine {
         env.storage()
             .instance()
             .remove(&DataKey::MigrationWindow(bond_id));
-        env.events().publish(
-            (Symbol::new(&env, "migration_finalized"),),
-            (bond_id,),
-        );
+        env.events()
+            .publish((Symbol::new(&env, "migration_finalized"),), (bond_id,));
 
         Ok(())
     }
@@ -1115,10 +1117,8 @@ impl CouponEngine {
         env.storage()
             .instance()
             .remove(&DataKey::MigrationWindow(bond_id));
-        env.events().publish(
-            (Symbol::new(&env, "migration_rolled_back"),),
-            (bond_id,),
-        );
+        env.events()
+            .publish((Symbol::new(&env, "migration_rolled_back"),), (bond_id,));
 
         Ok(window)
     }
@@ -1233,12 +1233,15 @@ fn checked_ratio(value: i128, multiplier: i128, divisor: i128) -> Result<i128, B
 /// Issue #188: coupon writes for a bond with an open migration window are
 /// paused so in-flight state cannot be mutated mid-cutover.
 fn require_no_migration_window(env: &Env, bond_id: u64) -> Result<(), BondError> {
-    if env.storage().instance().has(&DataKey::MigrationWindow(bond_id)) {
+    if env
+        .storage()
+        .instance()
+        .has(&DataKey::MigrationWindow(bond_id))
+    {
         return Err(BondError::MigrationInProgress);
     }
     Ok(())
 }
-
 
 /// Issue #186: bound a report's performance against the trailing history.
 ///
@@ -2734,10 +2737,7 @@ mod test {
             &0,
         );
         oc.verify_report(&t.admin, &report_id, &2);
-        assert_eq!(
-            oc.get_verification_count(&report_id),
-            1
-        );
+        assert_eq!(oc.get_verification_count(&report_id), 1);
 
         let holders = vec![&t._env, holder.clone()];
         assert_eq!(
@@ -2748,7 +2748,12 @@ mod test {
 
         // A second independent verifier restores eligibility.
         let second_verifier = Address::generate(&t._env);
-        oc.register_provider(&t.admin, &second_verifier, &Symbol::new(&t._env, "satellite"), &3);
+        oc.register_provider(
+            &t.admin,
+            &second_verifier,
+            &Symbol::new(&t._env, "satellite"),
+            &3,
+        );
         oc.add_stake(
             &second_verifier,
             &nbbs_oracle_consumer::DEFAULT_MIN_VERIFIER_STAKE,
@@ -2870,7 +2875,10 @@ mod test {
         assert!(t.client.get_migration_window(&bond_id).is_none());
 
         // In-flight state was not lost and is fully usable after rollback.
-        assert_eq!(t.client.get_undistributed_total(&bond_id), undistributed_before);
+        assert_eq!(
+            t.client.get_undistributed_total(&bond_id),
+            undistributed_before
+        );
         assert_eq!(
             t.client.claimable_credits(&bond_id, &holder),
             claimable_before
