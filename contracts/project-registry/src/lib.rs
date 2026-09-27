@@ -553,6 +553,7 @@ impl ProjectRegistry {
             .get(&DataKey::Admin)
             .ok_or(RegistryError::NotInitialized)
     }
+
     /// Issue #188: versioned-interface convention — bump when the contract's
     /// storage layout or callable interface changes in a breaking way. See
     /// docs/upgrade-migrations.md.
