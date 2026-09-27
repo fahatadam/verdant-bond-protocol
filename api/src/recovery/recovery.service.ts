@@ -94,7 +94,7 @@ export class RecoveryService {
     this.audit('resume_started', operation, last?.stepIndex ?? 0);
 
     let state: Record<string, any> = last?.state ?? {};
-    let startIndex = (last?.stepIndex ?? 0);
+    const startIndex = (last?.stepIndex ?? 0);
 
     for (let index = startIndex; index < operation.steps.length; index++) {
       const step = operation.steps[index];

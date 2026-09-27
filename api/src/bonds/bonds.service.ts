@@ -84,9 +84,7 @@ export class BondsService {
     const adminSecret = this.getAdminSecret();
     const adminAddress = this.stellarService.getKeypairFromSecret(adminSecret).publicKey();
 
-    const configScVal = this.encodeBondConfig(dto);
 
-    const { result } = await this.contractService.invokeContractMethod(
     const nonce = await this.nonceService.next(this.configService.getBondIssuerAddress(), adminAddress);
 
     const configScVal = this.encodeBondConfig(dto);
