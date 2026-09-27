@@ -217,6 +217,7 @@ export class BondsService {
       requested_amount: Number(amount),
       expected_failure
     };
+  }
   private async verifySubscriptionEligibility(bondId: number, dto: SubscribeDto): Promise<void> {
     const isRestrictedTranche = dto.tranche === TrancheType.RESTRICTED_ACCREDITED;
 
@@ -485,8 +486,7 @@ export class BondsService {
     return out;
   }
 
-  async getClaimableCreditDetails(id: number, address?: string): Promise<ClaimableCreditsResponse> {
-    if (!address) throw new BadRequestException('Invalid wallet address');
+
   /**
    * Itemized claimable-credit provenance for a single holder on a single bond
    * (issue #156). Surfaces every period/report/type line so the UI can group
@@ -538,16 +538,6 @@ export class BondsService {
       total: total.toString(),
       details,
     };
-      args: [nativeToScVal(BigInt(bondId), { type: 'u64' }), Address.fromString(address).toScVal()],
-    });
-
-    const raw = scValToNative(scVal);
-    const details = Array.isArray(raw)
-      ? raw.map((entry) => decodeClaimableCreditDetail(entry))
-      : [];
-
-    const total = details.reduce((sum, line) => sum + BigInt(line.amount), 0n);
-    return { bondId, address, total: total.toString(), details };
   }
 
   /**

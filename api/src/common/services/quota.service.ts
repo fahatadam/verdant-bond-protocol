@@ -35,8 +35,8 @@ export class QuotaService {
     }
 
     const key = `quota:${resource}:${actorId}`;
-    let usage = await this.redis.get(key);
-    let count = usage ? parseInt(usage, 10) : 0;
+    const usage = await this.redis.get(key);
+    const count = usage ? parseInt(usage, 10) : 0;
 
     const limit = QUOTA_LIMITS[resource];
     if (count >= limit) {

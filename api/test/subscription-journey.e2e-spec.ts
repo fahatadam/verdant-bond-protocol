@@ -8,9 +8,9 @@ describe('Subscription Journey (e2e)', () => {
   let app: INestApplication;
   let adminToken: string;
   let investorToken: string;
-  let adminKey = Keypair.random();
-  let investorKey = Keypair.random();
-  let bondId = 1;
+  const adminKey = Keypair.random();
+  const investorKey = Keypair.random();
+  const bondId = 1;
 
   beforeAll(async () => {
     const moduleRef: TestingModule = await Test.createTestingModule({

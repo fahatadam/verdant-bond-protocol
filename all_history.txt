@@ -1,0 +1,2924 @@
+commit 4939901d9c9bc6884bf28f056af230ae29d4c9bd
+Author: Fahat Adam <fahatadam4u@gmail.com>
+Date:   Fri Sep 25 15:44:59 2026 +0100
+
+    fix: include DEX-acquired bond holders in coupon distribution
+
+diff --git a/api/src/bonds/bonds.service.ts b/api/src/bonds/bonds.service.ts
+index e69de29..0940298 100644
+--- a/api/src/bonds/bonds.service.ts
++++ b/api/src/bonds/bonds.service.ts
+@@ -0,0 +1,672 @@
++import { Injectable, BadRequestException } from '@nestjs/common';
++import { ContractService } from '../stellar/contract.service';
++import { ContractException } from '../stellar/contract-errors';
++import { StellarService } from '../stellar/stellar.service';
++import { NonceService } from '../common/services/nonce.service';
++import { RedisService } from '../common/services/redis.service';
++import { SigningKeyProvider } from '../common/services/signing-key.provider';
++import { HolderIndexService } from './holder-index.service';
++import { CreateBondDto } from './dto/create-bond.dto';
++import { SubscribeDto } from './dto/subscribe.dto';
++import { DistributeCouponDto } from './dto/distribute-coupon.dto';
++import { ClaimCreditsDto } from './dto/claim-credits.dto';
++import { TransferBondDto } from './dto/transfer-bond.dto';
++import { nativeToScVal, scValToNative, Address, xdr } from '@stellar/stellar-sdk';
++import * as crypto from 'crypto';
++import {
++  BondResponse,
++  HeldBondResponse,
++  SubscriptionResponse,
++  HolderListResponse,
++  CouponDistributionResponse,
++  ClaimCreditsResponse,
++  TransferResponse,
++  UndistributedTotalResponse,
++  SweepUndistributedResponse,
++  BondStatusEnum,
++  BondMaturityStatusEnum,
++  CreditTypeEnum,
++} from './interfaces/bond.interface';
++import { toBigIntString } from '../common/utils';
++import { ConfigService } from '../config/config.service';
++import { OracleService } from '../oracle/oracle.service';
++import { ReportStatus } from '../oracle/interfaces/oracle.interface';
++import { Address, nativeToScVal, scValToNative, xdr } from '@stellar/stellar-sdk';
++
++const BOND_ERROR_CODE = {
++  NotInitialized: 1,
++  Unauthorized: 2,
++  InvalidNonce: 3,
++  BondNotFound: 4,
++  BondAlreadyMatured: 5,
++  InsufficientSupply: 6,
++  ZeroAmount: 7,
++  ProjectNotApproved: 8,
++  Overflow: 9,
++  ReportNotVerified: 10,
++};
++
++@Injectable()
++export class BondsService {
++  constructor(
++    private readonly contractService: ContractService,
++    private readonly stellarService: StellarService,
++    private readonly nonceService: NonceService,
++    private readonly redis: RedisService,
++    private readonly signingKeys: SigningKeyProvider,
++    private readonly configService: ConfigService,
++    private readonly holderIndex: HolderIndexService,
++    @Optional() private readonly oracleService?: OracleService,
++  ) {}
++
++  async create(dto: CreateBondDto): Promise<BondResponse> {
++    const adminSecret = this.getAdminSecret();
++    const adminAddress = this.stellarService.getKeypairFromSecret(adminSecret).publicKey();
++    const nonce = await this.nonceService.next(this.configService.getBondIssuerAddress(), adminAddress);
++
++    const configScVal = this.encodeBondConfig(dto);
++
++    const { result } = await this.contractService.invokeContractMethod(
++      this.configService.getBondIssuerAddress(), 'issue_bond', adminSecret,
++      [Address.fromString(adminAddress).toScVal(), configScVal],
++      nonce,
++    );
++
++    const bondId = Number(scValToNative(result));
++    const bond = await this.buildBondResponse(bondId);
++    await this.redis.setEx(`bond:${bondId}`, 300, JSON.stringify(bond));
++    return bond;
++  }
++
++  async findAll(page = 1, limit = 20) {
++    const cacheKey = `bonds:${page}:${limit}`;
++    const cached = await this.redis.get(cacheKey);
++    if (cached) return JSON.parse(cached);
++
++    const bonds: BondResponse[] = [];
++    let total = 0;
++
++    try {
++      const countScVal = await this.contractService.simulateCall({
++        contractAddress: this.configService.getBondIssuerAddress(), method: 'bond_count', args: [],
++      });
++      total = Number(scValToNative(countScVal));
++    } catch {}
++
++    const start = (page - 1) * limit;
++    const end = Math.min(start + limit, total);
++
++    for (let id = 1; id <= total; id++) {
++      if (id > start && id <= end) {
++        try {
++          bonds.push(await this.buildBondResponse(id));
++        } catch {}
++      }
++    }
++
++    const result = {
++      data: bonds,
++      meta: { page, limit, total, totalPages: Math.ceil(total / limit) || 1 },
++    };
++
++    await this.redis.setEx(cacheKey, 60, JSON.stringify(result));
++    return result;
++  }
++
++  async findOne(id: number): Promise<BondResponse> {
++    const cached = await this.redis.get(`bond:${id}`);
++    if (cached) return JSON.parse(cached);
++
++    const bond = await this.buildBondResponse(id);
++    await this.redis.setEx(`bond:${id}`, 300, JSON.stringify(bond));
++    return bond;
++  }
++
++  async findHeldByAddress(address: string): Promise<HeldBondResponse[]> {
++    try {
++      Address.fromString(address);
++    } catch {
++      throw new BadRequestException('Invalid wallet address');
++    }
++
++    let total = 0;
++    try {
++      const countScVal = await this.contractService.simulateCall({
++        contractAddress: this.configService.getBondIssuerAddress(), method: 'bond_count', args: [],
++      });
++      total = Number(scValToNative(countScVal));
++    } catch {
++      return [];
++    }
++
++    const heldBonds: HeldBondResponse[] = [];
++    for (let id = 1; id <= total; id++) {
++      try {
++        const balanceScVal = await this.contractService.simulateCall({
++          contractAddress: this.configService.getBondIssuerAddress(), method: 'get_holder_balance',
++          args: [nativeToScVal(BigInt(id), { type: 'u64' }), Address.fromString(address).toScVal()],
++        });
++        const balance = toBigIntString(scValToNative(balanceScVal));
++        if (balance !== '0') {
++          heldBonds.push({ ...(await this.findOne(id)), balance });
++        }
++      } catch {}
++    }
++
++    return heldBonds;
++  }
++
++  async subscribe(id: number, dto: SubscribeDto): Promise<SubscriptionResponse> {
++    const investorSecret = this.signingKeys.investorSecret();
++    const nonce = await this.nonceService.next(this.configService.getBondIssuerAddress(), dto.investorAddress);
++    const { transactionHash } = await this.contractService.invokeContractMethod(
++      this.configService.getBondIssuerAddress(), 'subscribe', investorSecret,
++      [
++        Address.fromString(dto.investorAddress).toScVal(),
++        nativeToScVal(BigInt(id), { type: 'u64' }),
++        nativeToScVal(BigInt(dto.amount), { type: 'i128' }),
++      ],
++      nonce,
++    );
++
++    await this.redis.del(`bond:${id}`);
++    await this.holderIndex.recordSubscribe(id, dto.investorAddress);
++    this.invalidatePortfolio(dto.investorAddress);
++
++    return { bondId: id, investorAddress: dto.investorAddress, amount: toBigIntString(dto.amount), transactionHash: transactionHash || '' };
++  }
++
++  async getHolders(id: number): Promise<HolderListResponse> {
++    const holders = await this.holderIndex.getHoldersWithBalances(id);
++    return { bondId: id, holders, total: holders.length };
++  }
++
++  /**
++   * Atomically refresh every panel of a bond's detail (issue #4). Fetches the
++   * bond summary, holders, and coupon undistributed total together and derives
++   * a single maturity status, so callers never commit a mix of pre- and
++   * post-mutation values. `loadedAt` lets the client refresh model detect
++   * staleness against its own `lastLoadedAt`.
++   */
++  async getBondDetail(id: number): Promise<BondDetailResponse> {
++    const bond = await this.buildBondResponse(id);
++    const [holdersResponse, couponResponse] = await Promise.all([
++      this.getHolders(id),
++      this.getUndistributedTotal(id),
++    ]);
++
++    const now = Math.floor(Date.now() / 1000);
++    const reached = bond.status === 1 || now >= bond.maturityDate;
++    const secondsUntil = reached ? 0 : bond.maturityDate - now;
++
++    return {
++      bond,
++      holders: holdersResponse.holders,
++      coupon: { undistributedTotal: couponResponse.undistributedTotal },
++      maturity: { reached, date: bond.maturityDate, secondsUntil },
++      loadedAt: new Date().toISOString(),
++    };
++  }
++
++  async distributeCoupon(id: number, dto: DistributeCouponDto): Promise<CouponDistributionResponse> {
++    const adminSecret = this.getAdminSecret();
++    const adminAddress = this.stellarService.getKeypairFromSecret(adminSecret).publicKey();
++    const nonce = await this.nonceService.next(this.configService.getCouponEngineAddress(), adminAddress);
++
++    const holderAddresses = await this.holderIndex.getHoldersForCoupon(id, { requireFresh: true });
++    // Challenge linkage (#oracle-challenge): a coupon pays out on the carbon
++    // data in the referenced oracle report. If that report is Challenged or
++    // Rejected, the data is disputed and must not be paid on, so block before
++    // any contract call is made. The oracle dependency is optional so the bond
++    // module keeps working where the oracle module is not wired in.
++    if (this.oracleService) {
++      const report = await this.oracleService.getReport(dto.reportId);
++      if (report.status === ReportStatus.Challenged) {
++        throw new BadRequestException(
++          `Cannot distribute coupon: report ${report.id} is currently Challenged. ` +
++            'Resolve the challenge before distributing.',
++        );
++      }
++      if (report.status === ReportStatus.Rejected) {
++        throw new BadRequestException(`Cannot distribute coupon: report ${report.id} was Rejected.`);
++      }
++    }
++
++
++
++    const { result } = await this.contractService.invokeContractMethod(
++      this.configService.getCouponEngineAddress(), 'distribute_coupon', adminSecret,
++      [
++        Address.fromString(adminAddress).toScVal(),
++        nativeToScVal(BigInt(id), { type: 'u64' }),
++        nativeToScVal(dto.periodIndex, { type: 'u32' }),
++        xdr.ScVal.scvVec(holderAddresses.map((h) => Address.fromString(h).toScVal())),
++        nativeToScVal(BigInt(dto.reportId), { type: 'u64' }),
++      ],
++      nonce,
++    );
++
++    const parsed = scValToNative(result) as any[];
++    return {
++      bondId: id,
++      periodIndex: dto.periodIndex,
++      totalCredits: toBigIntString(parsed?.[2] ?? 0),
++      holderCount: Number(parsed?.[3] ?? 0),
++    };
++  }
++
++  async claimCredits(id: number, dto: ClaimCreditsDto): Promise<ClaimCreditsResponse> {
++    const investorSecret = this.signingKeys.investorSecret();
++    const nonce = await this.nonceService.next(this.configService.getCouponEngineAddress(), dto.investorAddress);
++
++    const { result, transactionHash } = await this.contractService.invokeContractMethod(
++      this.configService.getCouponEngineAddress(), 'claim_credits', investorSecret,
++      [
++        Address.fromString(dto.investorAddress).toScVal(),
++        nativeToScVal(BigInt(id), { type: 'u64' }),
++      ],
++      nonce,
++    );
++
++    this.invalidatePortfolio(dto.investorAddress);
++
++    return {
++      bondId: id,
++      investorAddress: dto.investorAddress,
++      credits: toBigIntString(scValToNative(result)),
++      transactionHash: transactionHash || '',
++    };
++  }
++
++  async transfer(id: number, dto: TransferBondDto): Promise<TransferResponse> {
++    const investorSecret = this.signingKeys.investorSecret();
++    const nonce = await this.nonceService.next(this.configService.getBondIssuerAddress(), dto.fromAddress);
++
++    const { transactionHash } = await this.contractService.invokeContractMethod(
++      this.configService.getBondIssuerAddress(), 'transfer', investorSecret,
++      [
++        Address.fromString(dto.fromAddress).toScVal(),
++        Address.fromString(dto.toAddress).toScVal(),
++        nativeToScVal(BigInt(id), { type: 'u64' }),
++        nativeToScVal(BigInt(dto.amount), { type: 'i128' }),
++      ],
++      nonce,
++    );
++
++    await this.holderIndex.recordTransfer(id, dto.fromAddress, dto.toAddress);
++    this.invalidatePortfolio(dto.fromAddress);
++    this.invalidatePortfolio(dto.toAddress);
++
++    return {
++      bondId: id,
++      fromAddress: dto.fromAddress,
++      toAddress: dto.toAddress,
++      amount: toBigIntString(dto.amount),
++      transactionHash: transactionHash || '',
++    };
++  }
++
++  /**
++   * Operational repair (#117): reconcile the authoritative holder index for a
++   * single bond against on-chain balances, rediscovering any out-of-band
++   * transfers. Returns the reconciled holder list.
++   */
++  async reconcileBond(id: number): Promise<HolderListResponse> {
++    const holders = await this.holderIndex.reconcileBond(id);
++    return { bondId: id, holders, total: holders.length };
++  }
++
++  /**
++   * Operational repair (#117): reindex every bond against on-chain balances.
++   * Use after Redis loss or when direct contract transfers may have occurred.
++   */
++  async reindexHolders(): Promise<Array<{ bondId: number; total: number }>> {
++    let total = 0;
++    try {
++      const countScVal = await this.contractService.simulateCall({
++        contractAddress: this.configService.getBondIssuerAddress(), method: 'bond_count', args: [],
++      });
++      total = Number(scValToNative(countScVal));
++    } catch {}
++
++    const result = await this.holderIndex.reindexAll(total);
++    return Object.entries(result).map(([bondId, holders]) => ({ bondId: Number(bondId), total: holders.length }));
++  }
++
++  async getUndistributedTotal(id: number): Promise<UndistributedTotalResponse> {
++    const resultScVal = await this.contractService.simulateCall({
++      contractAddress: this.configService.getCouponEngineAddress(), method: 'get_undistributed_total',
++      args: [nativeToScVal(BigInt(id), { type: 'u64' })],
++    });
++
++    return {
++      bondId: id,
++      undistributedTotal: toBigIntString(scValToNative(resultScVal)),
++    };
++  }
++
++  /**
++   * Aggregate of claimable coupon credits for a wallet across every bond it
++   * holds. Best-effort: bonds whose coupon engine call fails are skipped so a
++   * single unreadable period cannot blank the whole portfolio view.
++   */
++  async getClaimableCredits(
++    address: string,
++  ): Promise<Array<{ bondId: number; amount: string }>> {
++    try {
++      Address.fromString(address);
++    } catch {
++      throw new BadRequestException('Invalid wallet address');
++    }
++
++    const held = await this.findHeldByAddress(address);
++    const out: Array<{ bondId: number; amount: string }> = [];
++    for (const bond of held) {
++      try {
++        const scVal = await this.contractService.simulateCall({
++          contractAddress: this.configService.getCouponEngineAddress(),
++          method: 'get_claimable_credits',
++          args: [Address.fromString(address).toScVal(), nativeToScVal(BigInt(bond.id), { type: 'u64' })],
++        });
++        const amount = toBigIntString(scValToNative(scVal));
++        if (amount !== '0') out.push({ bondId: bond.id, amount });
++      } catch {}
++    }
++    return out;
++  }
++
++  /**
++   * All credit retirement records belonging to a wallet, used by the portfolio
++   * aggregate view.
++   */
++  async getRetiredCredits(
++    address: string,
++  ): Promise<Array<{ id: number; bondId: number; amount: string; creditType: string; retiredAt: number }>> {
++    try {
++      Address.fromString(address);
++    } catch {
++      throw new BadRequestException('Invalid wallet address');
++    }
++
++    const out: Array<{ id: number; bondId: number; amount: string; creditType: string; retiredAt: number }> = [];
++    try {
++      const countScVal = await this.contractService.simulateCall({
++        contractAddress: this.configService.getCreditRetirementAddress(),
++        method: 'total_retirements',
++        args: [],
++      });
++      const total = Number(scValToNative(countScVal));
++      for (let id = 1; id <= total; id++) {
++        try {
++          const recScVal = await this.contractService.simulateCall({
++            contractAddress: this.configService.getCreditRetirementAddress(),
++            method: 'get_retirement_record',
++            args: [nativeToScVal(BigInt(id), { type: 'u64' })],
++          });
++          const record = scValToNative(recScVal) as any[];
++          const holder = (record[1] as any)?.toString?.() ?? '';
++          if (holder !== address) continue;
++          out.push({
++            id: Number(record[0]),
++            bondId: Number(record[2]),
++            amount: toBigIntString(record[3]),
++            creditType: record[4] as string,
++            retiredAt: Number(record[5]),
++          });
++        } catch {}
++      }
++    } catch {}
++    return out;
++  }
++
++  /** Invalidate the cached portfolio aggregate for a wallet (#116). */
++  private invalidatePortfolio(address: string): void {
++    if (!address) return;
++    this.redis.del(`portfolio:${address}`).catch(() => undefined);
++  }
++
++  async sweepUndistributed(id: number): Promise<SweepUndistributedResponse> {
++    const adminSecret = this.getAdminSecret();
++    const adminAddress = this.stellarService.getKeypairFromSecret(adminSecret).publicKey();
++    const nonce = await this.nonceService.next(this.configService.getCouponEngineAddress(), adminAddress);
++
++    const { result, transactionHash } = await this.contractService.invokeContractMethod(
++      this.configService.getCouponEngineAddress(), 'sweep_undistributed', adminSecret,
++      [
++        Address.fromString(adminAddress).toScVal(),
++        nativeToScVal(BigInt(id), { type: 'u64' }),
++      ],
++      nonce,
++    );
++
++    return {
++      bondId: id,
++      swept: toBigIntString(scValToNative(result)),
++      transactionHash: transactionHash || '',
++    };
++  }
++
++  async mature(id: number): Promise<BondResponse> {
++    const adminSecret = this.getAdminSecret();
++    const adminAddress = this.stellarService.getKeypairFromSecret(adminSecret).publicKey();
++    const nonce = await this.nonceService.next(this.configService.getBondIssuerAddress(), adminAddress);
++
++    try {
++      await this.contractService.invokeContractMethod(
++        this.configService.getBondIssuerAddress(), 'mature_bond', adminSecret,
++        [Address.fromString(adminAddress).toScVal(), nativeToScVal(BigInt(id), { type: 'u64' })],
++        nonce,
++      );
++    } catch (error) {
++      throw this.mapBondError(error, id);
++    }
++
++    await this.redis.del(`bond:${id}`);
++    await this.redis.delPattern('portfolio:*').catch(() => undefined);
++    return this.buildBondResponse(id);
++  }
++
++  private encodeBondConfig(dto: CreateBondDto): xdr.ScVal {
++    return xdr.ScVal.scvVec([
++      xdr.ScVal.scvBytes(Buffer.from(dto.projectId, 'hex')),
++      nativeToScVal(BigInt(dto.faceValue), { type: 'i128' }),
++      xdr.ScVal.scvVec(dto.couponSchedule.map((ts) => nativeToScVal(BigInt(ts), { type: 'u64' }))),
++      nativeToScVal(dto.creditType, { type: 'symbol' }),
++      nativeToScVal(BigInt(dto.maturityDate), { type: 'u64' }),
++      nativeToScVal(BigInt(dto.totalSupply), { type: 'i128' }),
++    ]);
++  }
++
++  private async buildBondResponse(id: number): Promise<BondResponse> {
++    const configScVal = await this.contractService.simulateCall({
++      contractAddress: this.configService.getBondIssuerAddress(), method: 'get_bond',
++      args: [nativeToScVal(BigInt(id), { type: 'u64' })],
++    });
++    const config = scValToNative(configScVal) as any[];
++
++    const stateScVal = await this.contractService.simulateCall({
++      contractAddress: this.configService.getBondIssuerAddress(), method: 'get_bond_state',
++      args: [nativeToScVal(BigInt(id), { type: 'u64' })],
++    });
++    const state = scValToNative(stateScVal) as any[];
++
++    const status = state[1] as BondStatusEnum;
++    const maturityDate = Number(config[4]);
++    const nowSeconds = Math.floor(Date.now() / 1000);
++    const maturityStatus =
++      status === BondStatusEnum.Matured || nowSeconds >= maturityDate
++        ? BondMaturityStatusEnum.Matured
++        : BondMaturityStatusEnum.Active;
++
++    return {
++      id,
++      projectId: Buffer.from(config[0] as Uint8Array).toString('hex'),
++      faceValue: toBigIntString(config[1]),
++      couponSchedule: (config[2] as any[]).map((v: bigint) => toBigIntString(v)),
++      creditType: config[3] as CreditTypeEnum,
++      maturityDate,
++      maturityStatus,
++      totalSupply: toBigIntString(config[5]),
++      totalSubscribed: toBigIntString(state[0]),
++      status,
++      createdAt: new Date(Number(state[2]) * 1000).toISOString(),
++    };
++  }
++
++  private mapBondError(error: unknown, bondId: number): any {
++    if (error instanceof ContractException) {
++      const code = error.rawErrorCode as number | undefined;
++      if (code === BOND_ERROR_CODE.BondAlreadyMatured) {
++        return new BadRequestException(`Bond ${bondId} is already matured`);
++      }
++      if (code === BOND_ERROR_CODE.BondNotFound) {
++        return new BadRequestException(`Bond ${bondId} not found`);
++      }
++      return new BadRequestException(error.detail || String(error.message));
++    }
++
++    if (error instanceof Error) {
++      return error;
++    }
++
++    return new BadRequestException('Failed to mature bond');
++  }
++
++  async exportBond(bondId: number, auditorAddress: string): Promise<any> {
++    // 1. Fetch bond config & state
++    const configScVal = await this.contractService.simulateCall({
++      contractAddress: this.configService.getBondIssuerAddress(),
++      method: 'get_bond',
++      args: [nativeToScVal(BigInt(bondId), { type: 'u64' })],
++    });
++    const config = scValToNative(configScVal) as any[];
++    if (!config || config.length === 0) {
++      throw new BadRequestException('Bond not found');
++    }
++
++    const stateScVal = await this.contractService.simulateCall({
++      contractAddress: this.configService.getBondIssuerAddress(),
++      method: 'get_bond_state',
++      args: [nativeToScVal(BigInt(bondId), { type: 'u64' })],
++    });
++    const state = scValToNative(stateScVal) as any[];
++
++    const bondData = {
++      id: bondId,
++      projectRegistryId: Buffer.from(config[0] as Uint8Array).toString('hex'),
++      faceValue: toBigIntString(config[1]),
++      couponSchedule: (config[2] as any[]).map((t) => Number(t)),
++      creditType: config[3],
++      maturityDate: Number(config[4]),
++      totalSupply: toBigIntString(config[5]),
++      totalSubscribed: toBigIntString(state[0]),
++      status: state[1],
++      createdAt: new Date(Number(state[2]) * 1000).toISOString(),
++    };
++
++    // 2. Lifecycle events
++    const lifecycleEvents: any[] = [
++      {
++        event: 'ISSUED',
++        timestamp: bondData.createdAt,
++        details: { totalSupply: bondData.totalSupply },
++      },
++    ];
++    if (Number(state[1]) === 1) { // Matured
++      lifecycleEvents.push({
++        event: 'MATURED',
++        timestamp: new Date(Number(config[4]) * 1000).toISOString(),
++        details: {},
++      });
++    }
++
++    // 3. Holders list
++    const holdersResponse = await this.getHolders(bondId);
++    const holders = holdersResponse.holders || [];
++
++    // 4. Coupon distributions
++    const couponDistributions: any[] = [];
++    const scheduleLength = bondData.couponSchedule.length;
++    for (let period = 0; period < scheduleLength; period++) {
++      try {
++        const periodInfoScVal = await this.contractService.simulateCall({
++          contractAddress: this.configService.getCouponEngineAddress(),
++          method: 'get_period_info',
++          args: [
++            nativeToScVal(BigInt(bondId), { type: 'u64' }),
++            nativeToScVal(period, { type: 'u32' }),
++          ],
++        });
++        const periodInfo = scValToNative(periodInfoScVal) as any[];
++        if (periodInfo && periodInfo[4]) { // distributed is true
++          couponDistributions.push({
++            periodIndex: Number(periodInfo[0]),
++            startTime: Number(periodInfo[1]),
++            endTime: Number(periodInfo[2]),
++            totalCreditsEarned: toBigIntString(periodInfo[3]),
++            reportId: Number(periodInfo[5]),
++            undistributed: toBigIntString(periodInfo[6]),
++          });
++        }
++      } catch {}
++    }
++
++    // 5. Credit retirements
++    const retirements: any[] = [];
++    try {
++      const countScVal = await this.contractService.simulateCall({
++        contractAddress: this.configService.getCreditRetirementAddress(),
++        method: 'total_retirements',
++        args: [],
++      });
++      const totalRetirements = Number(scValToNative(countScVal));
++      for (let retId = 1; retId <= totalRetirements; retId++) {
++        try {
++          const recScVal = await this.contractService.simulateCall({
++            contractAddress: this.configService.getCreditRetirementAddress(),
++            method: 'get_retirement_record',
++            args: [nativeToScVal(BigInt(retId), { type: 'u64' })],
++          });
++          const record = scValToNative(recScVal) as any[];
++          if (Number(record[2]) === bondId) {
++            retirements.push({
++              id: Number(record[0]),
++              holder: (record[1] as any).toString?.() || '',
++              amount: toBigIntString(record[3]),
++              creditType: record[4],
++              retiredAt: Number(record[5]),
++              certificateIpfsHash: Buffer.from(record[6] as Uint8Array).toString('hex'),
++            });
++          }
++        } catch {}
++      }
++    } catch {}
++
++    // 6. Construct payload & checksum
++    const payload: any = {
++      generationMetadata: {
++        timestamp: new Date().toISOString(),
++        exporterAddress: auditorAddress || 'system',
++        version: '1.0.0',
++      },
++      bond: bondData,
++      lifecycleEvents,
++      holders,
++      couponDistributions,
++      retirements,
++    };
++
++    // Calculate sha256 checksum over sorted payload fields
++    const sortedData = JSON.stringify(payload, Object.keys(payload).sort());
++    payload.generationMetadata.checksum = crypto
++      .createHash('sha256')
++      .update(sortedData)
++      .digest('hex');
++
++    return payload;
++  }
++
++  private getAdminSecret(): string {
++    return this.signingKeys.adminSecret();
++  }
++}
+
+commit c7f3720a3e0cdcc17dfab182e68f9e17a933fae2
+Merge: c24bc80 1852962
+Author: Pri_ss_ca <136065253+prissca@users.noreply.github.com>
+Date:   Wed Sep 23 18:43:38 2026 +0100
+
+    Merge branch 'main' into fix/stateful-nonces-transactions-cache-project-auth
+
+commit 3608ec451ac0afb0ca362d86742f4402f180c125
+Author: Doris Maduegbunam <dorismaduegbunam@gmail.com>
+Date:   Wed Sep 2 03:57:49 2026 +0100
+
+    feat: admin console UI, bond subscription preview, and environment switching
+
+diff --git a/api/src/bonds/bonds.service.ts b/api/src/bonds/bonds.service.ts
+index f35c859..b3fcc5d 100644
+Binary files a/api/src/bonds/bonds.service.ts and b/api/src/bonds/bonds.service.ts differ
+
+commit c24bc809b68bc470afe41f10c1ee56ddb55ef331
+Merge: 5660a51 79e9cd9
+Author: Mosas2000 <tosinolosasa@gmail.com>
+Date:   Tue Sep 1 22:38:47 2026 +0100
+
+    Merge remote-tracking branch 'upstream/main' into fix/stateful-nonces-transactions-cache-project-auth
+    
+    # Conflicts:
+    #       api/src/bonds/bonds.service.spec.ts
+    #       api/src/bonds/bonds.service.ts
+    #       api/src/common/common.module.ts
+    #       api/src/common/services/redis.service.ts
+    #       api/src/marketplace/dex.service.spec.ts
+    #       api/src/marketplace/dex.service.ts
+    #       api/src/oracle/oracle.monitoring.service.spec.ts
+    #       api/src/oracle/oracle.service.spec.ts
+    #       api/src/projects/projects.controller.ts
+    #       api/src/projects/projects.service.ts
+    #       api/src/stellar/contract.service.ts
+
+commit 5660a5107a40108eddb37ce426d584e01ec55791
+Merge: dd42afd 796ced1
+Author: Mosas2000 <tosinolosasa@gmail.com>
+Date:   Tue Sep 1 22:11:41 2026 +0100
+
+    Merge branch 'main' of https://github.com/verdant-bond-protocol/verdant-bond-protocol into fix/stateful-nonces-transactions-cache-project-auth
+    
+    # Conflicts:
+    #       api/src/bonds/bonds.service.spec.ts
+    #       api/src/bonds/bonds.service.ts
+    #       api/src/marketplace/dex.service.spec.ts
+    #       api/src/marketplace/dex.service.ts
+    #       api/src/oracle/oracle.service.spec.ts
+    #       api/src/oracle/oracle.service.ts
+    #       api/src/projects/projects.service.ts
+
+commit 1256f69f6d54544383391c9efdfcd65c786fb9ec
+Merge: 8e47d15 7e6f64a
+Author: dimka <110455012+dimka90@users.noreply.github.com>
+Date:   Mon Aug 31 14:01:55 2026 +0100
+
+    Merge branch 'main' into fix/assigned-issues-146-148-149-150
+
+commit 8e47d154e697da0271330bdcb8104e512effa6ed
+Author: dimka90 <dimkayilrit@gmail.com>
+Date:   Mon Aug 31 12:33:34 2026 +0100
+
+    fix: assigned issues #146, #148, #149, #150
+    
+    - bond-issuer: enforce methodology/credit-type compatibility on issuance (#146)
+    - bonds: redemption funding coverage and per-holder liability (#150)
+    - project-registry: add get_project_methodology read (#146)
+    - governance/project-registry: audit receipts and evidence groundwork (#148/#149)
+    - api/frontend: CI repair and guard/route matrix updates
+    
+    Closes #146
+    Closes #148
+    Closes #149
+    Closes #150
+
+diff --git a/api/src/bonds/bonds.service.ts b/api/src/bonds/bonds.service.ts
+index 44297fa..18e2b1d 100644
+--- a/api/src/bonds/bonds.service.ts
++++ b/api/src/bonds/bonds.service.ts
+@@ -1,4 +1,4 @@
+-import { Injectable, BadRequestException } from '@nestjs/common';
++import { Injectable, BadRequestException, Optional } from '@nestjs/common';
+ import { ContractService } from '../stellar/contract.service';
+ import { ContractException } from '../stellar/contract-errors';
+ import { StellarService } from '../stellar/stellar.service';
+@@ -23,6 +23,7 @@ import {
+   TransferResponse,
+   UndistributedTotalResponse,
+   SweepUndistributedResponse,
++  BondDetailResponse,
+   BondStatusEnum,
+   BondMaturityStatusEnum,
+   CreditTypeEnum,
+@@ -31,7 +32,6 @@ import { toBigIntString } from '../common/utils';
+ import { ConfigService } from '../config/config.service';
+ import { OracleService } from '../oracle/oracle.service';
+ import { ReportStatus } from '../oracle/interfaces/oracle.interface';
+-import { Address, nativeToScVal, scValToNative, xdr } from '@stellar/stellar-sdk';
+ 
+ const BOND_ERROR_CODE = {
+   NotInitialized: 1,
+@@ -196,7 +196,9 @@ export class BondsService {
+     ]);
+ 
+     const now = Math.floor(Date.now() / 1000);
+-    const reached = bond.status === 1 || now >= bond.maturityDate;
++    const reached =
++      bond.maturityStatus === BondMaturityStatusEnum.Matured ||
++      now >= bond.maturityDate;
+     const secondsUntil = reached ? 0 : bond.maturityDate - now;
+ 
+     return {
+@@ -232,8 +234,6 @@ export class BondsService {
+       }
+     }
+ 
+-    const holderAddresses = await this.redis.sMembers(`bond:${id}:holders`);
+-
+     const { result } = await this.contractService.invokeContractMethod(
+       this.configService.getCouponEngineAddress(), 'distribute_coupon', adminSecret,
+       [
+
+commit 7e6f64a0bf34a1317f4a5df8e6479a43783b2866
+Merge: 8189b45 cf0fb63
+Author: Pri_ss_ca <136065253+prissca@users.noreply.github.com>
+Date:   Mon Aug 31 11:27:22 2026 +0100
+
+    Merge pull request #178 from devsimze/feat/credit-precision-claimable-schema-anomaly-156-159
+    
+    Itemized claimable credits, credit precision, oracle anomaly detection, and storage snapshots (#156-#159)
+
+commit 5a2b0505028bca6abf1aaed90d7c5be34beb8b88
+Merge: eccecb3 237abc7
+Author: frienzy <frienzy514@gmail.com>
+Date:   Mon Aug 31 10:39:34 2026 +0100
+
+    Merge branch 'main' into feat/issues-86-87-88-89
+
+commit cf0fb63395a31d60391b59a1a6916a32742311a6
+Author: devsimze <238806700+devsimze@users.noreply.github.com>
+Date:   Mon Aug 31 10:11:38 2026 +0100
+
+    feat: itemized claimable credits, credit precision, oracle anomaly detection, and contract storage snapshots
+    
+    Resolves a stalled stash-pop conflict from PR #175 and completes the
+    #156-159 work:
+    
+    - #156: bond detail now groups claimable credits by report, coupon
+      period, and credit type instead of a single lump sum.
+    - #157: introduces a shared minor-unit precision strategy for carbon
+      and biodiversity credits, applied consistently across contracts,
+      API, and frontend display.
+    - #158: adds cross-source anomaly detection for oracle adapter
+      outputs before report submission, with reasons and provider/source
+      values recorded for monitoring.
+    - #159: adds per-contract storage schema fixtures and compatibility
+      tests so schema-breaking changes fail CI unless a migration is
+      documented.
+    
+    Also fixes an oracle-consumer regression introduced while wiring up
+    this work: DEFAULT_SIGNATURE_THRESHOLD had been dropped from 2 to 1,
+    letting a single admin call finalize a report and undercutting the
+    documented multi-source verification guarantee. Restored the
+    threshold to 2 and updated the coupon-engine and integration test
+    helpers to submit two independent verifications instead of loosening
+    the on-chain guarantee.
+    
+    Closes #156, closes #157, closes #158, closes #159
+    
+    Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+
+diff --git a/api/src/bonds/bonds.service.ts b/api/src/bonds/bonds.service.ts
+index 44297fa..25ad4b1 100644
+--- a/api/src/bonds/bonds.service.ts
++++ b/api/src/bonds/bonds.service.ts
+@@ -1,4 +1,4 @@
+-import { Injectable, BadRequestException } from '@nestjs/common';
++import { Injectable, BadRequestException, Optional } from '@nestjs/common';
+ import { ContractService } from '../stellar/contract.service';
+ import { ContractException } from '../stellar/contract-errors';
+ import { StellarService } from '../stellar/stellar.service';
+@@ -26,12 +26,14 @@ import {
+   BondStatusEnum,
+   BondMaturityStatusEnum,
+   CreditTypeEnum,
++  ClaimableCreditDetail,
++  ClaimableCreditsResponse,
++  BondDetailResponse,
+ } from './interfaces/bond.interface';
+ import { toBigIntString } from '../common/utils';
+ import { ConfigService } from '../config/config.service';
+ import { OracleService } from '../oracle/oracle.service';
+ import { ReportStatus } from '../oracle/interfaces/oracle.interface';
+-import { Address, nativeToScVal, scValToNative, xdr } from '@stellar/stellar-sdk';
+ 
+ const BOND_ERROR_CODE = {
+   NotInitialized: 1,
+@@ -196,7 +198,7 @@ export class BondsService {
+     ]);
+ 
+     const now = Math.floor(Date.now() / 1000);
+-    const reached = bond.status === 1 || now >= bond.maturityDate;
++    const reached = bond.status === BondStatusEnum.Matured || now >= bond.maturityDate;
+     const secondsUntil = reached ? 0 : bond.maturityDate - now;
+ 
+     return {
+@@ -232,8 +234,6 @@ export class BondsService {
+       }
+     }
+ 
+-    const holderAddresses = await this.redis.sMembers(`bond:${id}:holders`);
+-
+     const { result } = await this.contractService.invokeContractMethod(
+       this.configService.getCouponEngineAddress(), 'distribute_coupon', adminSecret,
+       [
+@@ -365,8 +365,8 @@ export class BondsService {
+       try {
+         const scVal = await this.contractService.simulateCall({
+           contractAddress: this.configService.getCouponEngineAddress(),
+-          method: 'get_claimable_credits',
+-          args: [Address.fromString(address).toScVal(), nativeToScVal(BigInt(bond.id), { type: 'u64' })],
++          method: 'claimable_credits',
++          args: [nativeToScVal(BigInt(bond.id), { type: 'u64' }), Address.fromString(address).toScVal()],
+         });
+         const amount = toBigIntString(scValToNative(scVal));
+         if (amount !== '0') out.push({ bondId: bond.id, amount });
+@@ -375,6 +375,39 @@ export class BondsService {
+     return out;
+   }
+ 
++  /**
++   * Itemized claimable-credit provenance for a single holder on a single bond
++   * (issue #156). Surfaces every period/report/type line so the UI can group
++   * claimable credits exactly as `claim_credits` clears them.
++   */
++  async getClaimableCreditDetails(
++    bondId: number,
++    address?: string,
++  ): Promise<ClaimableCreditsResponse> {
++    if (!address) {
++      throw new BadRequestException('Wallet address is required');
++    }
++    try {
++      Address.fromString(address);
++    } catch {
++      throw new BadRequestException('Invalid wallet address');
++    }
++
++    const scVal = await this.contractService.simulateCall({
++      contractAddress: this.configService.getCouponEngineAddress(),
++      method: 'claimable_credit_details',
++      args: [nativeToScVal(BigInt(bondId), { type: 'u64' }), Address.fromString(address).toScVal()],
++    });
++
++    const raw = scValToNative(scVal);
++    const details = Array.isArray(raw)
++      ? raw.map((entry) => decodeClaimableCreditDetail(entry))
++      : [];
++
++    const total = details.reduce((sum, line) => sum + BigInt(line.amount), 0n);
++    return { bondId, address, total: total.toString(), details };
++  }
++
+   /**
+    * All credit retirement records belonging to a wallet, used by the portfolio
+    * aggregate view.
+@@ -670,3 +703,58 @@ export class BondsService {
+     return this.signingKeys.adminSecret();
+   }
+ }
++
++/** Coerce a bigint/number SCVal field into a JS number. */
++function toNumber(value: unknown): number {
++  if (typeof value === 'number') return value;
++  if (typeof value === 'bigint') return Number(value);
++  return Number(value ?? 0);
++}
++
++/**
++ * Defensively decode a single `ClaimableCreditDetail` tuple. The contracttype
++ * struct round-trips as either an object (map form) or a positional array,
++ * depending on the XDR encoder version.
++ */
++function decodeClaimableCreditDetail(raw: unknown): ClaimableCreditDetail {
++  if (Array.isArray(raw)) {
++    const [periodIndex, reportId, startTime, endTime, creditType, amount] = raw;
++    return {
++      periodIndex: toNumber(periodIndex),
++      reportId: toNumber(reportId),
++      startTime: toNumber(startTime),
++      endTime: toNumber(endTime),
++      creditType: String(creditType),
++      amount: toBigIntString(amount),
++    };
++  }
++
++  const entry = (raw ?? {}) as Record<string, unknown>;
++  const pick = (key: string) => entry[key] ?? entry[toCamelCase(key)];
++  return {
++    periodIndex: toNumber(pick('period_index')),
++    reportId: toNumber(pick('report_id')),
++    startTime: toNumber(pick('start_time')),
++    endTime: toNumber(pick('end_time')),
++    creditType: String(pick('credit_type') ?? ''),
++    amount: toBigIntString(toBigint(pick('amount'))),
++  };
++}
++
++function toCamelCase(key: string): string {
++  return key.replace(/_([a-z])/g, (_, ch: string) => ch.toUpperCase());
++}
++
++/** Coerce an SCVal amount field into a bigint for string serialization. */
++function toBigint(value: unknown): bigint {
++  if (typeof value === 'bigint') return value;
++  if (typeof value === 'number') return BigInt(Math.trunc(value));
++  if (typeof value === 'string') {
++    try {
++      return BigInt(value);
++    } catch {
++      return 0n;
++    }
++  }
++  return 0n;
++}
+
+commit c023b94e4c926273101d945936818e6e31036e69
+Merge: b48b1b0 4e61e45
+Author: Luchi5544 <sharonsamuel839@gmail.com>
+Date:   Sun Aug 30 04:26:20 2026 +0100
+
+    Merge branch 'main' into feat/authoritative-holders-portfolio-intent-idempotency
+
+commit b48b1b031e5df1ba8ab137be5af57ae6559f0a11
+Author: Luchi5544 <samuelsharon839@gmail.com>
+Date:   Sun Aug 30 04:21:27 2026 +0100
+
+    feat(portfolio): wallet-scoped aggregate endpoint and dashboard (#116)
+    
+    Users lacked a complete portfolio view and had to reconstruct state from
+    many scattered endpoints. This adds a portfolio aggregation endpoint.
+    
+    - GET /portfolio (wallet-scoped; admins may pass ?address=) aggregates held
+      bonds, open marketplace listings, claimable credits, retired credits, and
+      pending actions
+    - BondsService exposes getClaimableCredits / getRetiredCredits; PortfolioService
+      builds and caches the view (30s TTL)
+    - mutations (subscribe/transfer/claim/mature/list/buy/cancel/deposit/withdraw)
+      invalidate the cached portfolio so it is never stale after an action
+    - frontend ApiService.getPortfolio + dashboard 'My Portfolio' section consume it
+    - tests cover a multi-bond, multi-order wallet and cache behaviour
+
+diff --git a/api/src/bonds/bonds.service.ts b/api/src/bonds/bonds.service.ts
+index efb524c..5faf97d 100644
+--- a/api/src/bonds/bonds.service.ts
++++ b/api/src/bonds/bonds.service.ts
+@@ -5,6 +5,7 @@ import { StellarService } from '../stellar/stellar.service';
+ import { NonceService } from '../common/services/nonce.service';
+ import { RedisService } from '../common/services/redis.service';
+ import { SigningKeyProvider } from '../common/services/signing-key.provider';
++import { HolderIndexService } from './holder-index.service';
+ import { CreateBondDto } from './dto/create-bond.dto';
+ import { SubscribeDto } from './dto/subscribe.dto';
+ import { DistributeCouponDto } from './dto/distribute-coupon.dto';
+@@ -28,7 +29,6 @@ import {
+ } from './interfaces/bond.interface';
+ import { toBigIntString } from '../common/utils';
+ import { ConfigService } from '../config/config.service';
+-import { Address, nativeToScVal, scValToNative, xdr } from '@stellar/stellar-sdk';
+ 
+ const BOND_ERROR_CODE = {
+   NotInitialized: 1,
+@@ -52,6 +52,7 @@ export class BondsService {
+     private readonly redis: RedisService,
+     private readonly signingKeys: SigningKeyProvider,
+     private readonly configService: ConfigService,
++    private readonly holderIndex: HolderIndexService,
+   ) {}
+ 
+   async create(dto: CreateBondDto): Promise<BondResponse> {
+@@ -165,26 +166,14 @@ export class BondsService {
+     );
+ 
+     await this.redis.del(`bond:${id}`);
+-    await this.redis.sAdd(`bond:${id}:holders`, dto.investorAddress);
++    await this.holderIndex.recordSubscribe(id, dto.investorAddress);
++    this.invalidatePortfolio(dto.investorAddress);
+ 
+     return { bondId: id, investorAddress: dto.investorAddress, amount: toBigIntString(dto.amount), transactionHash: transactionHash || '' };
+   }
+ 
+   async getHolders(id: number): Promise<HolderListResponse> {
+-    const holderAddresses = await this.redis.sMembers(`bond:${id}:holders`);
+-    const holders = [];
+-
+-    for (const address of holderAddresses) {
+-      try {
+-        const balanceScVal = await this.contractService.simulateCall({
+-          contractAddress: this.configService.getBondIssuerAddress(), method: 'get_holder_balance',
+-          args: [nativeToScVal(BigInt(id), { type: 'u64' }), Address.fromString(address).toScVal()],
+-        });
+-        const balance = toBigIntString(scValToNative(balanceScVal));
+-        if (balance !== '0') holders.push({ address, balance });
+-      } catch {}
+-    }
+-
++    const holders = await this.holderIndex.getHoldersWithBalances(id);
+     return { bondId: id, holders, total: holders.length };
+   }
+ 
+@@ -193,7 +182,7 @@ export class BondsService {
+     const adminAddress = this.stellarService.getKeypairFromSecret(adminSecret).publicKey();
+     const nonce = await this.nonceService.next(this.configService.getCouponEngineAddress(), adminAddress);
+ 
+-    const holderAddresses = await this.redis.sMembers(`bond:${id}:holders`);
++    const holderAddresses = await this.holderIndex.getHoldersForCoupon(id, { requireFresh: true });
+ 
+     const { result } = await this.contractService.invokeContractMethod(
+       this.configService.getCouponEngineAddress(), 'distribute_coupon', adminSecret,
+@@ -229,6 +218,8 @@ export class BondsService {
+       nonce,
+     );
+ 
++    this.invalidatePortfolio(dto.investorAddress);
++
+     return {
+       bondId: id,
+       investorAddress: dto.investorAddress,
+@@ -252,7 +243,9 @@ export class BondsService {
+       nonce,
+     );
+ 
+-    await this.redis.sAdd(`bond:${id}:holders`, dto.toAddress);
++    await this.holderIndex.recordTransfer(id, dto.fromAddress, dto.toAddress);
++    this.invalidatePortfolio(dto.fromAddress);
++    this.invalidatePortfolio(dto.toAddress);
+ 
+     return {
+       bondId: id,
+@@ -263,6 +256,33 @@ export class BondsService {
+     };
+   }
+ 
++  /**
++   * Operational repair (#117): reconcile the authoritative holder index for a
++   * single bond against on-chain balances, rediscovering any out-of-band
++   * transfers. Returns the reconciled holder list.
++   */
++  async reconcileBond(id: number): Promise<HolderListResponse> {
++    const holders = await this.holderIndex.reconcileBond(id);
++    return { bondId: id, holders, total: holders.length };
++  }
++
++  /**
++   * Operational repair (#117): reindex every bond against on-chain balances.
++   * Use after Redis loss or when direct contract transfers may have occurred.
++   */
++  async reindexHolders(): Promise<Array<{ bondId: number; total: number }>> {
++    let total = 0;
++    try {
++      const countScVal = await this.contractService.simulateCall({
++        contractAddress: this.configService.getBondIssuerAddress(), method: 'bond_count', args: [],
++      });
++      total = Number(scValToNative(countScVal));
++    } catch {}
++
++    const result = await this.holderIndex.reindexAll(total);
++    return Object.entries(result).map(([bondId, holders]) => ({ bondId: Number(bondId), total: holders.length }));
++  }
++
+   async getUndistributedTotal(id: number): Promise<UndistributedTotalResponse> {
+     const resultScVal = await this.contractService.simulateCall({
+       contractAddress: this.configService.getCouponEngineAddress(), method: 'get_undistributed_total',
+@@ -275,6 +295,86 @@ export class BondsService {
+     };
+   }
+ 
++  /**
++   * Aggregate of claimable coupon credits for a wallet across every bond it
++   * holds. Best-effort: bonds whose coupon engine call fails are skipped so a
++   * single unreadable period cannot blank the whole portfolio view.
++   */
++  async getClaimableCredits(
++    address: string,
++  ): Promise<Array<{ bondId: number; amount: string }>> {
++    try {
++      Address.fromString(address);
++    } catch {
++      throw new BadRequestException('Invalid wallet address');
++    }
++
++    const held = await this.findHeldByAddress(address);
++    const out: Array<{ bondId: number; amount: string }> = [];
++    for (const bond of held) {
++      try {
++        const scVal = await this.contractService.simulateCall({
++          contractAddress: this.configService.getCouponEngineAddress(),
++          method: 'get_claimable_credits',
++          args: [Address.fromString(address).toScVal(), nativeToScVal(BigInt(bond.id), { type: 'u64' })],
++        });
++        const amount = toBigIntString(scValToNative(scVal));
++        if (amount !== '0') out.push({ bondId: bond.id, amount });
++      } catch {}
++    }
++    return out;
++  }
++
++  /**
++   * All credit retirement records belonging to a wallet, used by the portfolio
++   * aggregate view.
++   */
++  async getRetiredCredits(
++    address: string,
++  ): Promise<Array<{ id: number; bondId: number; amount: string; creditType: string; retiredAt: number }>> {
++    try {
++      Address.fromString(address);
++    } catch {
++      throw new BadRequestException('Invalid wallet address');
++    }
++
++    const out: Array<{ id: number; bondId: number; amount: string; creditType: string; retiredAt: number }> = [];
++    try {
++      const countScVal = await this.contractService.simulateCall({
++        contractAddress: this.configService.getCreditRetirementAddress(),
++        method: 'total_retirements',
++        args: [],
++      });
++      const total = Number(scValToNative(countScVal));
++      for (let id = 1; id <= total; id++) {
++        try {
++          const recScVal = await this.contractService.simulateCall({
++            contractAddress: this.configService.getCreditRetirementAddress(),
++            method: 'get_retirement_record',
++            args: [nativeToScVal(BigInt(id), { type: 'u64' })],
++          });
++          const record = scValToNative(recScVal) as any[];
++          const holder = (record[1] as any)?.toString?.() ?? '';
++          if (holder !== address) continue;
++          out.push({
++            id: Number(record[0]),
++            bondId: Number(record[2]),
++            amount: toBigIntString(record[3]),
++            creditType: record[4] as string,
++            retiredAt: Number(record[5]),
++          });
++        } catch {}
++      }
++    } catch {}
++    return out;
++  }
++
++  /** Invalidate the cached portfolio aggregate for a wallet (#116). */
++  private invalidatePortfolio(address: string): void {
++    if (!address) return;
++    this.redis.del(`portfolio:${address}`).catch(() => undefined);
++  }
++
+   async sweepUndistributed(id: number): Promise<SweepUndistributedResponse> {
+     const adminSecret = this.getAdminSecret();
+     const adminAddress = this.stellarService.getKeypairFromSecret(adminSecret).publicKey();
+@@ -312,6 +412,7 @@ export class BondsService {
+     }
+ 
+     await this.redis.del(`bond:${id}`);
++    await this.redis.delPattern('portfolio:*').catch(() => undefined);
+     return this.buildBondResponse(id);
+   }
+ 
+
+commit c503da007cbe207290192dbbd8f1380d99d20a08
+Author: Jess52487 <jessysam52487@gmail.com>
+Date:   Sat Aug 29 10:41:18 2026 +0100
+
+    feat(oracle): challenge review API, coupon linkage, and frontend panel
+    
+    Issue 3: add oracle challenge review endpoints (project challenged reports, report challenge state, coupon eligibility) backed by OracleService. Block BondService.distributeCoupon when the referenced report is Challenged/Rejected via an optional OracleService dependency. Frontend gains the three API methods, a ChallengedReportsComponent wired into project detail, and a coupon-eligibility warning on bond detail. Includes lifecycle doc.
+
+diff --git a/api/src/bonds/bonds.service.ts b/api/src/bonds/bonds.service.ts
+index efb524c..70ae725 100644
+--- a/api/src/bonds/bonds.service.ts
++++ b/api/src/bonds/bonds.service.ts
+@@ -28,6 +28,8 @@ import {
+ } from './interfaces/bond.interface';
+ import { toBigIntString } from '../common/utils';
+ import { ConfigService } from '../config/config.service';
++import { OracleService } from '../oracle/oracle.service';
++import { ReportStatus } from '../oracle/interfaces/oracle.interface';
+ import { Address, nativeToScVal, scValToNative, xdr } from '@stellar/stellar-sdk';
+ 
+ const BOND_ERROR_CODE = {
+@@ -52,6 +54,7 @@ export class BondsService {
+     private readonly redis: RedisService,
+     private readonly signingKeys: SigningKeyProvider,
+     private readonly configService: ConfigService,
++    @Optional() private readonly oracleService?: OracleService,
+   ) {}
+ 
+   async create(dto: CreateBondDto): Promise<BondResponse> {
+@@ -188,11 +191,56 @@ export class BondsService {
+     return { bondId: id, holders, total: holders.length };
+   }
+ 
++  /**
++   * Atomically refresh every panel of a bond's detail (issue #4). Fetches the
++   * bond summary, holders, and coupon undistributed total together and derives
++   * a single maturity status, so callers never commit a mix of pre- and
++   * post-mutation values. `loadedAt` lets the client refresh model detect
++   * staleness against its own `lastLoadedAt`.
++   */
++  async getBondDetail(id: number): Promise<BondDetailResponse> {
++    const bond = await this.buildBondResponse(id);
++    const [holdersResponse, couponResponse] = await Promise.all([
++      this.getHolders(id),
++      this.getUndistributedTotal(id),
++    ]);
++
++    const now = Math.floor(Date.now() / 1000);
++    const reached = bond.status === 1 || now >= bond.maturityDate;
++    const secondsUntil = reached ? 0 : bond.maturityDate - now;
++
++    return {
++      bond,
++      holders: holdersResponse.holders,
++      coupon: { undistributedTotal: couponResponse.undistributedTotal },
++      maturity: { reached, date: bond.maturityDate, secondsUntil },
++      loadedAt: new Date().toISOString(),
++    };
++  }
++
+   async distributeCoupon(id: number, dto: DistributeCouponDto): Promise<CouponDistributionResponse> {
+     const adminSecret = this.getAdminSecret();
+     const adminAddress = this.stellarService.getKeypairFromSecret(adminSecret).publicKey();
+     const nonce = await this.nonceService.next(this.configService.getCouponEngineAddress(), adminAddress);
+ 
++    // Challenge linkage (#oracle-challenge): a coupon pays out on the carbon
++    // data in the referenced oracle report. If that report is Challenged or
++    // Rejected, the data is disputed and must not be paid on, so block before
++    // any contract call is made. The oracle dependency is optional so the bond
++    // module keeps working where the oracle module is not wired in.
++    if (this.oracleService) {
++      const report = await this.oracleService.getReport(dto.reportId);
++      if (report.status === ReportStatus.Challenged) {
++        throw new BadRequestException(
++          `Cannot distribute coupon: report ${report.id} is currently Challenged. ` +
++            'Resolve the challenge before distributing.',
++        );
++      }
++      if (report.status === ReportStatus.Rejected) {
++        throw new BadRequestException(`Cannot distribute coupon: report ${report.id} was Rejected.`);
++      }
++    }
++
+     const holderAddresses = await this.redis.sMembers(`bond:${id}:holders`);
+ 
+     const { result } = await this.contractService.invokeContractMethod(
+
+commit f33b7cbfd3099d65973ee25d63b3da5f0e99063e
+Merge: 5603f7f db7ef0e
+Author: Obiajulu-gif <okoyeemmanuel998@gmail.com>
+Date:   Sat Aug 29 08:30:44 2026 +0100
+
+    Merge main into PR 136 and resolve test wiring
+
+commit 9724631dffc15a1ec96fbcecda96cfadf62f3fb7
+Author: Diamond437rough <sulej8520@gmail.com>
+Date:   Fri Aug 28 10:12:04 2026 +0100
+
+    stellar: include contract error codes in decode; map ContractException.rawErrorCode in DEX/Bonds; add unit tests
+
+diff --git a/api/src/bonds/bonds.service.ts b/api/src/bonds/bonds.service.ts
+index 2c3bbe5..7edc288 100644
+--- a/api/src/bonds/bonds.service.ts
++++ b/api/src/bonds/bonds.service.ts
+@@ -1,5 +1,6 @@
+ import { Injectable, BadRequestException } from '@nestjs/common';
+ import { ContractService } from '../stellar/contract.service';
++import { ContractException } from '../stellar/contract-errors';
+ import { StellarService } from '../stellar/stellar.service';
+ import { NonceService } from '../common/services/nonce.service';
+ import { RedisService } from '../common/services/redis.service';
+@@ -361,9 +362,21 @@ export class BondsService {
+   }
+ 
+   private mapBondError(error: unknown, bondId: number): any {
++    if (error instanceof ContractException) {
++      const code = error.rawErrorCode as number | undefined;
++      if (code === BOND_ERROR_CODE.BondAlreadyMatured) {
++        return new BadRequestException(`Bond ${bondId} is already matured`);
++      }
++      if (code === BOND_ERROR_CODE.BondNotFound) {
++        return new BadRequestException(`Bond ${bondId} not found`);
++      }
++      return new BadRequestException(error.detail || String(error.message));
++    }
++
+     if (error instanceof Error) {
+       return error;
+     }
++
+     return new BadRequestException('Failed to mature bond');
+   }
+ 
+
+commit 13d6087aaf84fc740645d55893858e75874d95ff
+Author: fhayvy <ezefavourchiamaka01@gmail.com>
+Date:   Thu Aug 27 18:28:37 2026 +0100
+
+    feat: fix #76, #126, #122, #119 e2e tests, rate limits, auditor exports, and contract error mappings
+
+diff --git a/api/src/bonds/bonds.service.ts b/api/src/bonds/bonds.service.ts
+index 36c7caa..2c3bbe5 100644
+--- a/api/src/bonds/bonds.service.ts
++++ b/api/src/bonds/bonds.service.ts
+@@ -9,6 +9,8 @@ import { SubscribeDto } from './dto/subscribe.dto';
+ import { DistributeCouponDto } from './dto/distribute-coupon.dto';
+ import { ClaimCreditsDto } from './dto/claim-credits.dto';
+ import { TransferBondDto } from './dto/transfer-bond.dto';
++import { nativeToScVal, scValToNative, Address, xdr } from '@stellar/stellar-sdk';
++import * as crypto from 'crypto';
+ import {
+   BondResponse,
+   HeldBondResponse,
+@@ -358,27 +360,147 @@ export class BondsService {
+     };
+   }
+ 
+-  private mapBondError(error: unknown, bondId: number): Error {
+-    if (error instanceof BadRequestException) {
+-      const message = error.message;
+-      const match = message.match(/error code (\d+)/);
+-      const code = match ? Number(match[1]) : undefined;
+-
+-      if (code === BOND_ERROR_CODE.Overflow) {
+-        return new BadRequestException(
+-          `Bond #${bondId} cannot be matured before its maturity date. ` +
+-          'Maturation is only allowed once the maturity date has been reached.',
+-        );
+-      }
+-
+-      return error;
+-    }
++  private mapBondError(error: unknown, bondId: number): any {
+     if (error instanceof Error) {
+-      return new BadRequestException(error.message);
++      return error;
+     }
+     return new BadRequestException('Failed to mature bond');
+   }
+ 
++  async exportBond(bondId: number, auditorAddress: string): Promise<any> {
++    // 1. Fetch bond config & state
++    const configScVal = await this.contractService.simulateCall({
++      contractAddress: this.configService.getBondIssuerAddress(),
++      method: 'get_bond',
++      args: [nativeToScVal(BigInt(bondId), { type: 'u64' })],
++    });
++    const config = scValToNative(configScVal) as any[];
++    if (!config || config.length === 0) {
++      throw new BadRequestException('Bond not found');
++    }
++
++    const stateScVal = await this.contractService.simulateCall({
++      contractAddress: this.configService.getBondIssuerAddress(),
++      method: 'get_bond_state',
++      args: [nativeToScVal(BigInt(bondId), { type: 'u64' })],
++    });
++    const state = scValToNative(stateScVal) as any[];
++
++    const bondData = {
++      id: bondId,
++      projectRegistryId: Buffer.from(config[0] as Uint8Array).toString('hex'),
++      faceValue: toBigIntString(config[1]),
++      couponSchedule: (config[2] as any[]).map((t) => Number(t)),
++      creditType: config[3],
++      maturityDate: Number(config[4]),
++      totalSupply: toBigIntString(config[5]),
++      totalSubscribed: toBigIntString(state[0]),
++      status: state[1],
++      createdAt: new Date(Number(state[2]) * 1000).toISOString(),
++    };
++
++    // 2. Lifecycle events
++    const lifecycleEvents: any[] = [
++      {
++        event: 'ISSUED',
++        timestamp: bondData.createdAt,
++        details: { totalSupply: bondData.totalSupply },
++      },
++    ];
++    if (Number(state[1]) === 1) { // Matured
++      lifecycleEvents.push({
++        event: 'MATURED',
++        timestamp: new Date(Number(config[4]) * 1000).toISOString(),
++        details: {},
++      });
++    }
++
++    // 3. Holders list
++    const holdersResponse = await this.getHolders(bondId);
++    const holders = holdersResponse.holders || [];
++
++    // 4. Coupon distributions
++    const couponDistributions: any[] = [];
++    const scheduleLength = bondData.couponSchedule.length;
++    for (let period = 0; period < scheduleLength; period++) {
++      try {
++        const periodInfoScVal = await this.contractService.simulateCall({
++          contractAddress: this.configService.getCouponEngineAddress(),
++          method: 'get_period_info',
++          args: [
++            nativeToScVal(BigInt(bondId), { type: 'u64' }),
++            nativeToScVal(period, { type: 'u32' }),
++          ],
++        });
++        const periodInfo = scValToNative(periodInfoScVal) as any[];
++        if (periodInfo && periodInfo[4]) { // distributed is true
++          couponDistributions.push({
++            periodIndex: Number(periodInfo[0]),
++            startTime: Number(periodInfo[1]),
++            endTime: Number(periodInfo[2]),
++            totalCreditsEarned: toBigIntString(periodInfo[3]),
++            reportId: Number(periodInfo[5]),
++            undistributed: toBigIntString(periodInfo[6]),
++          });
++        }
++      } catch {}
++    }
++
++    // 5. Credit retirements
++    const retirements: any[] = [];
++    try {
++      const countScVal = await this.contractService.simulateCall({
++        contractAddress: this.configService.getCreditRetirementAddress(),
++        method: 'total_retirements',
++        args: [],
++      });
++      const totalRetirements = Number(scValToNative(countScVal));
++      for (let retId = 1; retId <= totalRetirements; retId++) {
++        try {
++          const recScVal = await this.contractService.simulateCall({
++            contractAddress: this.configService.getCreditRetirementAddress(),
++            method: 'get_retirement_record',
++            args: [nativeToScVal(BigInt(retId), { type: 'u64' })],
++          });
++          const record = scValToNative(recScVal) as any[];
++          if (Number(record[2]) === bondId) {
++            retirements.push({
++              id: Number(record[0]),
++              holder: (record[1] as any).toString?.() || '',
++              amount: toBigIntString(record[3]),
++              creditType: record[4],
++              retiredAt: Number(record[5]),
++              certificateIpfsHash: Buffer.from(record[6] as Uint8Array).toString('hex'),
++            });
++          }
++        } catch {}
++      }
++    } catch {}
++
++    // 6. Construct payload & checksum
++    const payload: any = {
++      generationMetadata: {
++        timestamp: new Date().toISOString(),
++        exporterAddress: auditorAddress || 'system',
++        version: '1.0.0',
++      },
++      bond: bondData,
++      lifecycleEvents,
++      holders,
++      couponDistributions,
++      retirements,
++    };
++
++    // Calculate sha256 checksum over sorted payload fields
++    const sortedData = JSON.stringify(payload, Object.keys(payload).sort());
++    payload.generationMetadata.checksum = crypto
++      .createHash('sha256')
++      .update(sortedData)
++      .digest('hex');
++
++    return payload;
++  }
++
+   private getAdminSecret(): string {
+     return this.signingKeys.adminSecret();
+   }
+
+commit c57530544ed36c3ff0290eab8be003b1f623561b
+Author: dimka90 <dimkayilrit@gmail.com>
+Date:   Thu Aug 27 09:18:31 2026 +0100
+
+    feat(ipfs): enforce upload size/MIME/extension policy with scan hook
+    
+    Adds an IpfsUploadPolicy with max content size, MIME allow-listing,
+    extension matching, magic-byte sniffing, and an optional malware-scan
+    hook, wired into the IPFS document-upload path.
+    
+    Also repairs pre-existing API breakage surfaced while validating the
+    module: registers ConfigService via a global ConfigModule (BondsService
+    and DexService depended on it but no module provided it), restores the
+    missing @stellar/stellar-sdk import in BondsService, and fixes service
+    specs broken by the string-amount and DI changes so the API suite is
+    green again.
+    
+    Refs: #123 #124 #125 #127
+
+diff --git a/api/src/bonds/bonds.service.ts b/api/src/bonds/bonds.service.ts
+index 36c7caa..85930af 100644
+--- a/api/src/bonds/bonds.service.ts
++++ b/api/src/bonds/bonds.service.ts
+@@ -25,6 +25,7 @@ import {
+ } from './interfaces/bond.interface';
+ import { toBigIntString } from '../common/utils';
+ import { ConfigService } from '../config/config.service';
++import { Address, nativeToScVal, scValToNative, xdr } from '@stellar/stellar-sdk';
+ 
+ const BOND_ERROR_CODE = {
+   NotInitialized: 1,
+
+commit eccecb3f5531c4babc0e20bc2588b62fd341f156
+Author: frienzy <frienzy514@gmail.com>
+Date:   Thu Aug 27 00:41:11 2026 +0100
+
+    feat: wallet auth guards, pending tx tracking, and client-side validation
+    
+    Implements issues #86, #87, #88, #89.
+    
+    - #86: functional route guard (walletAuthGuard) protecting
+      projects/new, bonds/issue, marketplace/sell; centralized
+      AuthService.sessionReady() combining JWT + wallet state; returnUrl
+      redirect flow; component-level disabled/hint gating on bond-detail
+      and marketplace-list mutating actions.
+    
+    - #87: PendingTransactionsService (signal + localStorage backed,
+      mirrors AuthService's token persistence pattern) polling a new
+      GET /api/stellar/transactions/:hash endpoint; wired into bond
+      issuance/subscribe/claim/transfer/sweep, marketplace list/buy, and
+      project registration flows; fixed several endpoints that discarded
+      their transactionHash; improved contract.service.ts's send-path
+      error decoding to surface real contract error codes.
+    
+    - #88: shared methodology/country/lat-lng validators mirrored between
+      CreateProjectDto (class-validator) and the project-create form
+      (Angular ValidatorFn); methodology is now a constrained <select>.
+    
+    - #89: coupon-schedule validators enforcing non-empty, ascending,
+      future, pre-maturity dates on both the DTO and the form; fixed a
+      real maturityDate milliseconds/seconds unit bug in issue-bond's
+      submit handler; documented schedule semantics in
+      docs/bond-coupon-schedule.md.
+    
+    Closes #86
+    Closes #87
+    Closes #88
+    Closes #89
+
+diff --git a/api/src/bonds/bonds.service.ts b/api/src/bonds/bonds.service.ts
+index 36c7caa..94b66a9 100644
+--- a/api/src/bonds/bonds.service.ts
++++ b/api/src/bonds/bonds.service.ts
+@@ -57,7 +57,7 @@ export class BondsService {
+ 
+     const configScVal = this.encodeBondConfig(dto);
+ 
+-    const { result } = await this.contractService.invokeContractMethod(
++    const { result, transactionHash } = await this.contractService.invokeContractMethod(
+       this.configService.getBondIssuerAddress(), 'issue_bond', adminSecret,
+       [Address.fromString(adminAddress).toScVal(), configScVal],
+       nonce,
+@@ -66,7 +66,7 @@ export class BondsService {
+     const bondId = Number(scValToNative(result));
+     const bond = await this.buildBondResponse(bondId);
+     await this.redis.setEx(`bond:${bondId}`, 300, JSON.stringify(bond));
+-    return bond;
++    return { ...bond, transactionHash };
+   }
+ 
+   async findAll(page = 1, limit = 20) {
+
+commit c315e399fce3903d7e74fc9f9bab410f25b49baf
+Author: JONAH-6 <maziemeka6@gmail.com>
+Date:   Wed Aug 26 13:59:07 2026 +0100
+
+    feat: implement oracle and project registry improvements
+
+diff --git a/api/src/bonds/bonds.service.ts b/api/src/bonds/bonds.service.ts
+index 1a1b3fa..36c7caa 100644
+--- a/api/src/bonds/bonds.service.ts
++++ b/api/src/bonds/bonds.service.ts
+@@ -4,7 +4,6 @@ import { StellarService } from '../stellar/stellar.service';
+ import { NonceService } from '../common/services/nonce.service';
+ import { RedisService } from '../common/services/redis.service';
+ import { SigningKeyProvider } from '../common/services/signing-key.provider';
+-import { xdr, nativeToScVal, scValToNative, Address } from '@stellar/stellar-sdk';
+ import { CreateBondDto } from './dto/create-bond.dto';
+ import { SubscribeDto } from './dto/subscribe.dto';
+ import { DistributeCouponDto } from './dto/distribute-coupon.dto';
+@@ -25,9 +24,7 @@ import {
+   CreditTypeEnum,
+ } from './interfaces/bond.interface';
+ import { toBigIntString } from '../common/utils';
+-
+-const BOND_ISSUER = () => process.env.BOND_ISSUER_ADDRESS || '';
+-const COUPON_ENGINE = () => process.env.COUPON_ENGINE_ADDRESS || '';
++import { ConfigService } from '../config/config.service';
+ 
+ const BOND_ERROR_CODE = {
+   NotInitialized: 1,
+@@ -50,17 +47,18 @@ export class BondsService {
+     private readonly nonceService: NonceService,
+     private readonly redis: RedisService,
+     private readonly signingKeys: SigningKeyProvider,
++    private readonly configService: ConfigService,
+   ) {}
+ 
+   async create(dto: CreateBondDto): Promise<BondResponse> {
+     const adminSecret = this.getAdminSecret();
+     const adminAddress = this.stellarService.getKeypairFromSecret(adminSecret).publicKey();
+-    const nonce = await this.nonceService.next(BOND_ISSUER(), adminAddress);
++    const nonce = await this.nonceService.next(this.configService.getBondIssuerAddress(), adminAddress);
+ 
+     const configScVal = this.encodeBondConfig(dto);
+ 
+     const { result } = await this.contractService.invokeContractMethod(
+-      BOND_ISSUER(), 'issue_bond', adminSecret,
++      this.configService.getBondIssuerAddress(), 'issue_bond', adminSecret,
+       [Address.fromString(adminAddress).toScVal(), configScVal],
+       nonce,
+     );
+@@ -81,7 +79,7 @@ export class BondsService {
+ 
+     try {
+       const countScVal = await this.contractService.simulateCall({
+-        contractAddress: BOND_ISSUER(), method: 'bond_count', args: [],
++        contractAddress: this.configService.getBondIssuerAddress(), method: 'bond_count', args: [],
+       });
+       total = Number(scValToNative(countScVal));
+     } catch {}
+@@ -125,7 +123,7 @@ export class BondsService {
+     let total = 0;
+     try {
+       const countScVal = await this.contractService.simulateCall({
+-        contractAddress: BOND_ISSUER(), method: 'bond_count', args: [],
++        contractAddress: this.configService.getBondIssuerAddress(), method: 'bond_count', args: [],
+       });
+       total = Number(scValToNative(countScVal));
+     } catch {
+@@ -136,7 +134,7 @@ export class BondsService {
+     for (let id = 1; id <= total; id++) {
+       try {
+         const balanceScVal = await this.contractService.simulateCall({
+-          contractAddress: BOND_ISSUER(), method: 'get_holder_balance',
++          contractAddress: this.configService.getBondIssuerAddress(), method: 'get_holder_balance',
+           args: [nativeToScVal(BigInt(id), { type: 'u64' }), Address.fromString(address).toScVal()],
+         });
+         const balance = toBigIntString(scValToNative(balanceScVal));
+@@ -151,9 +149,9 @@ export class BondsService {
+ 
+   async subscribe(id: number, dto: SubscribeDto): Promise<SubscriptionResponse> {
+     const investorSecret = this.signingKeys.investorSecret();
+-    const nonce = await this.nonceService.next(BOND_ISSUER(), dto.investorAddress);
++    const nonce = await this.nonceService.next(this.configService.getBondIssuerAddress(), dto.investorAddress);
+     const { transactionHash } = await this.contractService.invokeContractMethod(
+-      BOND_ISSUER(), 'subscribe', investorSecret,
++      this.configService.getBondIssuerAddress(), 'subscribe', investorSecret,
+       [
+         Address.fromString(dto.investorAddress).toScVal(),
+         nativeToScVal(BigInt(id), { type: 'u64' }),
+@@ -175,7 +173,7 @@ export class BondsService {
+     for (const address of holderAddresses) {
+       try {
+         const balanceScVal = await this.contractService.simulateCall({
+-          contractAddress: BOND_ISSUER(), method: 'get_holder_balance',
++          contractAddress: this.configService.getBondIssuerAddress(), method: 'get_holder_balance',
+           args: [nativeToScVal(BigInt(id), { type: 'u64' }), Address.fromString(address).toScVal()],
+         });
+         const balance = toBigIntString(scValToNative(balanceScVal));
+@@ -189,12 +187,12 @@ export class BondsService {
+   async distributeCoupon(id: number, dto: DistributeCouponDto): Promise<CouponDistributionResponse> {
+     const adminSecret = this.getAdminSecret();
+     const adminAddress = this.stellarService.getKeypairFromSecret(adminSecret).publicKey();
+-    const nonce = await this.nonceService.next(COUPON_ENGINE(), adminAddress);
++    const nonce = await this.nonceService.next(this.configService.getCouponEngineAddress(), adminAddress);
+ 
+     const holderAddresses = await this.redis.sMembers(`bond:${id}:holders`);
+ 
+     const { result } = await this.contractService.invokeContractMethod(
+-      COUPON_ENGINE(), 'distribute_coupon', adminSecret,
++      this.configService.getCouponEngineAddress(), 'distribute_coupon', adminSecret,
+       [
+         Address.fromString(adminAddress).toScVal(),
+         nativeToScVal(BigInt(id), { type: 'u64' }),
+@@ -216,10 +214,10 @@ export class BondsService {
+ 
+   async claimCredits(id: number, dto: ClaimCreditsDto): Promise<ClaimCreditsResponse> {
+     const investorSecret = this.signingKeys.investorSecret();
+-    const nonce = await this.nonceService.next(COUPON_ENGINE(), dto.investorAddress);
++    const nonce = await this.nonceService.next(this.configService.getCouponEngineAddress(), dto.investorAddress);
+ 
+     const { result, transactionHash } = await this.contractService.invokeContractMethod(
+-      COUPON_ENGINE(), 'claim_credits', investorSecret,
++      this.configService.getCouponEngineAddress(), 'claim_credits', investorSecret,
+       [
+         Address.fromString(dto.investorAddress).toScVal(),
+         nativeToScVal(BigInt(id), { type: 'u64' }),
+@@ -237,10 +235,10 @@ export class BondsService {
+ 
+   async transfer(id: number, dto: TransferBondDto): Promise<TransferResponse> {
+     const investorSecret = this.signingKeys.investorSecret();
+-    const nonce = await this.nonceService.next(BOND_ISSUER(), dto.fromAddress);
++    const nonce = await this.nonceService.next(this.configService.getBondIssuerAddress(), dto.fromAddress);
+ 
+     const { transactionHash } = await this.contractService.invokeContractMethod(
+-      BOND_ISSUER(), 'transfer', investorSecret,
++      this.configService.getBondIssuerAddress(), 'transfer', investorSecret,
+       [
+         Address.fromString(dto.fromAddress).toScVal(),
+         Address.fromString(dto.toAddress).toScVal(),
+@@ -263,7 +261,7 @@ export class BondsService {
+ 
+   async getUndistributedTotal(id: number): Promise<UndistributedTotalResponse> {
+     const resultScVal = await this.contractService.simulateCall({
+-      contractAddress: COUPON_ENGINE(), method: 'get_undistributed_total',
++      contractAddress: this.configService.getCouponEngineAddress(), method: 'get_undistributed_total',
+       args: [nativeToScVal(BigInt(id), { type: 'u64' })],
+     });
+ 
+@@ -276,10 +274,10 @@ export class BondsService {
+   async sweepUndistributed(id: number): Promise<SweepUndistributedResponse> {
+     const adminSecret = this.getAdminSecret();
+     const adminAddress = this.stellarService.getKeypairFromSecret(adminSecret).publicKey();
+-    const nonce = await this.nonceService.next(COUPON_ENGINE(), adminAddress);
++    const nonce = await this.nonceService.next(this.configService.getCouponEngineAddress(), adminAddress);
+ 
+     const { result, transactionHash } = await this.contractService.invokeContractMethod(
+-      COUPON_ENGINE(), 'sweep_undistributed', adminSecret,
++      this.configService.getCouponEngineAddress(), 'sweep_undistributed', adminSecret,
+       [
+         Address.fromString(adminAddress).toScVal(),
+         nativeToScVal(BigInt(id), { type: 'u64' }),
+@@ -297,11 +295,11 @@ export class BondsService {
+   async mature(id: number): Promise<BondResponse> {
+     const adminSecret = this.getAdminSecret();
+     const adminAddress = this.stellarService.getKeypairFromSecret(adminSecret).publicKey();
+-    const nonce = await this.nonceService.next(BOND_ISSUER(), adminAddress);
++    const nonce = await this.nonceService.next(this.configService.getBondIssuerAddress(), adminAddress);
+ 
+     try {
+       await this.contractService.invokeContractMethod(
+-        BOND_ISSUER(), 'mature_bond', adminSecret,
++        this.configService.getBondIssuerAddress(), 'mature_bond', adminSecret,
+         [Address.fromString(adminAddress).toScVal(), nativeToScVal(BigInt(id), { type: 'u64' })],
+         nonce,
+       );
+@@ -326,13 +324,13 @@ export class BondsService {
+ 
+   private async buildBondResponse(id: number): Promise<BondResponse> {
+     const configScVal = await this.contractService.simulateCall({
+-      contractAddress: BOND_ISSUER(), method: 'get_bond',
++      contractAddress: this.configService.getBondIssuerAddress(), method: 'get_bond',
+       args: [nativeToScVal(BigInt(id), { type: 'u64' })],
+     });
+     const config = scValToNative(configScVal) as any[];
+ 
+     const stateScVal = await this.contractService.simulateCall({
+-      contractAddress: BOND_ISSUER(), method: 'get_bond_state',
++      contractAddress: this.configService.getBondIssuerAddress(), method: 'get_bond_state',
+       args: [nativeToScVal(BigInt(id), { type: 'u64' })],
+     });
+     const state = scValToNative(stateScVal) as any[];
+
+commit 1b0679d826bdbc7662ccaa51921c17d605685695
+Author: harystyleseze <harystyleseze@gmail.com>
+Date:   Tue Aug 25 19:06:37 2026 -0700
+
+    fix: preserve i128/u64 precision across API boundary, fix CID encoding, improve slippage depth reporting
+
+diff --git a/api/src/bonds/bonds.service.ts b/api/src/bonds/bonds.service.ts
+index d16d5d3..1a1b3fa 100644
+--- a/api/src/bonds/bonds.service.ts
++++ b/api/src/bonds/bonds.service.ts
+@@ -24,6 +24,7 @@ import {
+   BondMaturityStatusEnum,
+   CreditTypeEnum,
+ } from './interfaces/bond.interface';
++import { toBigIntString } from '../common/utils';
+ 
+ const BOND_ISSUER = () => process.env.BOND_ISSUER_ADDRESS || '';
+ const COUPON_ENGINE = () => process.env.COUPON_ENGINE_ADDRESS || '';
+@@ -138,8 +139,8 @@ export class BondsService {
+           contractAddress: BOND_ISSUER(), method: 'get_holder_balance',
+           args: [nativeToScVal(BigInt(id), { type: 'u64' }), Address.fromString(address).toScVal()],
+         });
+-        const balance = Number(scValToNative(balanceScVal));
+-        if (balance > 0) {
++        const balance = toBigIntString(scValToNative(balanceScVal));
++        if (balance !== '0') {
+           heldBonds.push({ ...(await this.findOne(id)), balance });
+         }
+       } catch {}
+@@ -164,7 +165,7 @@ export class BondsService {
+     await this.redis.del(`bond:${id}`);
+     await this.redis.sAdd(`bond:${id}:holders`, dto.investorAddress);
+ 
+-    return { bondId: id, investorAddress: dto.investorAddress, amount: dto.amount, transactionHash: transactionHash || '' };
++    return { bondId: id, investorAddress: dto.investorAddress, amount: toBigIntString(dto.amount), transactionHash: transactionHash || '' };
+   }
+ 
+   async getHolders(id: number): Promise<HolderListResponse> {
+@@ -177,8 +178,8 @@ export class BondsService {
+           contractAddress: BOND_ISSUER(), method: 'get_holder_balance',
+           args: [nativeToScVal(BigInt(id), { type: 'u64' }), Address.fromString(address).toScVal()],
+         });
+-        const balance = Number(scValToNative(balanceScVal));
+-        if (balance > 0) holders.push({ address, balance });
++        const balance = toBigIntString(scValToNative(balanceScVal));
++        if (balance !== '0') holders.push({ address, balance });
+       } catch {}
+     }
+ 
+@@ -208,7 +209,7 @@ export class BondsService {
+     return {
+       bondId: id,
+       periodIndex: dto.periodIndex,
+-      totalCredits: Number(parsed?.[2] ?? 0),
++      totalCredits: toBigIntString(parsed?.[2] ?? 0),
+       holderCount: Number(parsed?.[3] ?? 0),
+     };
+   }
+@@ -229,7 +230,7 @@ export class BondsService {
+     return {
+       bondId: id,
+       investorAddress: dto.investorAddress,
+-      credits: Number(scValToNative(result)),
++      credits: toBigIntString(scValToNative(result)),
+       transactionHash: transactionHash || '',
+     };
+   }
+@@ -255,7 +256,7 @@ export class BondsService {
+       bondId: id,
+       fromAddress: dto.fromAddress,
+       toAddress: dto.toAddress,
+-      amount: dto.amount,
++      amount: toBigIntString(dto.amount),
+       transactionHash: transactionHash || '',
+     };
+   }
+@@ -268,7 +269,7 @@ export class BondsService {
+ 
+     return {
+       bondId: id,
+-      undistributedTotal: Number(scValToNative(resultScVal)),
++      undistributedTotal: toBigIntString(scValToNative(resultScVal)),
+     };
+   }
+ 
+@@ -288,7 +289,7 @@ export class BondsService {
+ 
+     return {
+       bondId: id,
+-      swept: Number(scValToNative(result)),
++      swept: toBigIntString(scValToNative(result)),
+       transactionHash: transactionHash || '',
+     };
+   }
+@@ -347,13 +348,13 @@ export class BondsService {
+     return {
+       id,
+       projectId: Buffer.from(config[0] as Uint8Array).toString('hex'),
+-      faceValue: Number(config[1]),
+-      couponSchedule: (config[2] as any[]).map((v: bigint) => Number(v)),
++      faceValue: toBigIntString(config[1]),
++      couponSchedule: (config[2] as any[]).map((v: bigint) => toBigIntString(v)),
+       creditType: config[3] as CreditTypeEnum,
+       maturityDate,
+       maturityStatus,
+-      totalSupply: Number(config[5]),
+-      totalSubscribed: Number(state[0]),
++      totalSupply: toBigIntString(config[5]),
++      totalSubscribed: toBigIntString(state[0]),
+       status,
+       createdAt: new Date(Number(state[2]) * 1000).toISOString(),
+     };
+
+commit dd42afdc24d9b3893ace2f4f8545f321635be603
+Author: Mosas2000 <tosinolosasa@gmail.com>
+Date:   Tue Aug 25 21:34:20 2026 +0100
+
+    fix: harden stateful contract workflows
+
+diff --git a/api/src/bonds/bonds.service.ts b/api/src/bonds/bonds.service.ts
+index c2a947c..effa3b7 100644
+--- a/api/src/bonds/bonds.service.ts
++++ b/api/src/bonds/bonds.service.ts
+@@ -53,14 +53,13 @@ export class BondsService {
+   async create(dto: CreateBondDto): Promise<BondResponse> {
+     const adminSecret = this.getAdminSecret();
+     const adminAddress = this.stellarService.getKeypairFromSecret(adminSecret).publicKey();
+-    const nonce = await this.nonceService.next(BOND_ISSUER(), adminAddress);
+ 
+     const configScVal = this.encodeBondConfig(dto);
+ 
+     const { result } = await this.contractService.invokeContractMethod(
+       BOND_ISSUER(), 'issue_bond', adminSecret,
+       [Address.fromString(adminAddress).toScVal(), configScVal],
+-      nonce,
++      adminAddress,
+     );
+ 
+     const bondId = Number(scValToNative(result));
+@@ -115,7 +114,6 @@ export class BondsService {
+ 
+   async subscribe(id: number, dto: SubscribeDto): Promise<SubscriptionResponse> {
+     const investorSecret = this.signingKeys.investorSecret();
+-    const nonce = await this.nonceService.next(BOND_ISSUER(), dto.investorAddress);
+     const { transactionHash } = await this.contractService.invokeContractMethod(
+       BOND_ISSUER(), 'subscribe', investorSecret,
+       [
+@@ -123,7 +121,7 @@ export class BondsService {
+         nativeToScVal(BigInt(id), { type: 'u64' }),
+         nativeToScVal(BigInt(dto.amount), { type: 'i128' }),
+       ],
+-      nonce,
++      dto.investorAddress,
+     );
+ 
+     await this.redis.del(`bond:${id}`);
+@@ -153,7 +151,6 @@ export class BondsService {
+   async distributeCoupon(id: number, dto: DistributeCouponDto): Promise<CouponDistributionResponse> {
+     const adminSecret = this.getAdminSecret();
+     const adminAddress = this.stellarService.getKeypairFromSecret(adminSecret).publicKey();
+-    const nonce = await this.nonceService.next(COUPON_ENGINE(), adminAddress);
+ 
+     const holderAddresses = await this.redis.sMembers(`bond:${id}:holders`);
+ 
+@@ -166,7 +163,7 @@ export class BondsService {
+         xdr.ScVal.scvVec(holderAddresses.map((h) => Address.fromString(h).toScVal())),
+         nativeToScVal(BigInt(dto.reportId), { type: 'u64' }),
+       ],
+-      nonce,
++      adminAddress,
+     );
+ 
+     const parsed = scValToNative(result) as any[];
+@@ -180,7 +177,6 @@ export class BondsService {
+ 
+   async claimCredits(id: number, dto: ClaimCreditsDto): Promise<ClaimCreditsResponse> {
+     const investorSecret = this.signingKeys.investorSecret();
+-    const nonce = await this.nonceService.next(COUPON_ENGINE(), dto.investorAddress);
+ 
+     const { result, transactionHash } = await this.contractService.invokeContractMethod(
+       COUPON_ENGINE(), 'claim_credits', investorSecret,
+@@ -188,7 +184,7 @@ export class BondsService {
+         Address.fromString(dto.investorAddress).toScVal(),
+         nativeToScVal(BigInt(id), { type: 'u64' }),
+       ],
+-      nonce,
++      dto.investorAddress,
+     );
+ 
+     return {
+@@ -201,7 +197,6 @@ export class BondsService {
+ 
+   async transfer(id: number, dto: TransferBondDto): Promise<TransferResponse> {
+     const investorSecret = this.signingKeys.investorSecret();
+-    const nonce = await this.nonceService.next(BOND_ISSUER(), dto.fromAddress);
+ 
+     const { transactionHash } = await this.contractService.invokeContractMethod(
+       BOND_ISSUER(), 'transfer', investorSecret,
+@@ -211,7 +206,7 @@ export class BondsService {
+         nativeToScVal(BigInt(id), { type: 'u64' }),
+         nativeToScVal(BigInt(dto.amount), { type: 'i128' }),
+       ],
+-      nonce,
++      dto.fromAddress,
+     );
+ 
+     await this.redis.sAdd(`bond:${id}:holders`, dto.toAddress);
+@@ -240,7 +235,6 @@ export class BondsService {
+   async sweepUndistributed(id: number): Promise<SweepUndistributedResponse> {
+     const adminSecret = this.getAdminSecret();
+     const adminAddress = this.stellarService.getKeypairFromSecret(adminSecret).publicKey();
+-    const nonce = await this.nonceService.next(COUPON_ENGINE(), adminAddress);
+ 
+     const { result, transactionHash } = await this.contractService.invokeContractMethod(
+       COUPON_ENGINE(), 'sweep_undistributed', adminSecret,
+@@ -248,7 +242,7 @@ export class BondsService {
+         Address.fromString(adminAddress).toScVal(),
+         nativeToScVal(BigInt(id), { type: 'u64' }),
+       ],
+-      nonce,
++      adminAddress,
+     );
+ 
+     return {
+@@ -261,13 +255,12 @@ export class BondsService {
+   async mature(id: number): Promise<BondResponse> {
+     const adminSecret = this.getAdminSecret();
+     const adminAddress = this.stellarService.getKeypairFromSecret(adminSecret).publicKey();
+-    const nonce = await this.nonceService.next(BOND_ISSUER(), adminAddress);
+ 
+     try {
+       await this.contractService.invokeContractMethod(
+         BOND_ISSUER(), 'mature_bond', adminSecret,
+         [Address.fromString(adminAddress).toScVal(), nativeToScVal(BigInt(id), { type: 'u64' })],
+-        nonce,
++        adminAddress,
+       );
+     } catch (error) {
+       throw this.mapBondError(error, id);
+
+commit 14c25cfa748dd641981aa3550d6cf47b47c539d1
+Author: Missshelby <89746820+Miss-shelby@users.noreply.github.com>
+Date:   Tue Aug 25 16:20:14 2026 +0000
+
+    feat: restrict bond listings to held balances
+
+diff --git a/api/src/bonds/bonds.service.ts b/api/src/bonds/bonds.service.ts
+index c2a947c..d16d5d3 100644
+--- a/api/src/bonds/bonds.service.ts
++++ b/api/src/bonds/bonds.service.ts
+@@ -12,6 +12,7 @@ import { ClaimCreditsDto } from './dto/claim-credits.dto';
+ import { TransferBondDto } from './dto/transfer-bond.dto';
+ import {
+   BondResponse,
++  HeldBondResponse,
+   SubscriptionResponse,
+   HolderListResponse,
+   CouponDistributionResponse,
+@@ -113,6 +114,40 @@ export class BondsService {
+     return bond;
+   }
+ 
++  async findHeldByAddress(address: string): Promise<HeldBondResponse[]> {
++    try {
++      Address.fromString(address);
++    } catch {
++      throw new BadRequestException('Invalid wallet address');
++    }
++
++    let total = 0;
++    try {
++      const countScVal = await this.contractService.simulateCall({
++        contractAddress: BOND_ISSUER(), method: 'bond_count', args: [],
++      });
++      total = Number(scValToNative(countScVal));
++    } catch {
++      return [];
++    }
++
++    const heldBonds: HeldBondResponse[] = [];
++    for (let id = 1; id <= total; id++) {
++      try {
++        const balanceScVal = await this.contractService.simulateCall({
++          contractAddress: BOND_ISSUER(), method: 'get_holder_balance',
++          args: [nativeToScVal(BigInt(id), { type: 'u64' }), Address.fromString(address).toScVal()],
++        });
++        const balance = Number(scValToNative(balanceScVal));
++        if (balance > 0) {
++          heldBonds.push({ ...(await this.findOne(id)), balance });
++        }
++      } catch {}
++    }
++
++    return heldBonds;
++  }
++
+   async subscribe(id: number, dto: SubscribeDto): Promise<SubscriptionResponse> {
+     const investorSecret = this.signingKeys.investorSecret();
+     const nonce = await this.nonceService.next(BOND_ISSUER(), dto.investorAddress);
+
+commit 7b81e95024e3748001fea74cd176a335eccd6d4e
+Author: Obiajulu-gif <okoyeemmanuel998@gmail.com>
+Date:   Tue Aug 25 10:21:30 2026 +0100
+
+    fix: harden oracle consensus and API infrastructure
+
+diff --git a/api/src/bonds/bonds.service.ts b/api/src/bonds/bonds.service.ts
+index 90bc6c6..c2a947c 100644
+--- a/api/src/bonds/bonds.service.ts
++++ b/api/src/bonds/bonds.service.ts
+@@ -2,8 +2,9 @@ import { Injectable, BadRequestException } from '@nestjs/common';
+ import { ContractService } from '../stellar/contract.service';
+ import { StellarService } from '../stellar/stellar.service';
+ import { NonceService } from '../common/services/nonce.service';
++import { RedisService } from '../common/services/redis.service';
++import { SigningKeyProvider } from '../common/services/signing-key.provider';
+ import { xdr, nativeToScVal, scValToNative, Address } from '@stellar/stellar-sdk';
+-import { createClient, RedisClientType } from '@redis/client';
+ import { CreateBondDto } from './dto/create-bond.dto';
+ import { SubscribeDto } from './dto/subscribe.dto';
+ import { DistributeCouponDto } from './dto/distribute-coupon.dto';
+@@ -41,16 +42,13 @@ const BOND_ERROR_CODE = {
+ 
+ @Injectable()
+ export class BondsService {
+-  private redis: RedisClientType;
+-
+   constructor(
+     private readonly contractService: ContractService,
+     private readonly stellarService: StellarService,
+     private readonly nonceService: NonceService,
+-  ) {
+-    this.redis = createClient({ url: process.env.REDIS_URL || 'redis://localhost:6379' });
+-    this.redis.connect().catch(() => {});
+-  }
++    private readonly redis: RedisService,
++    private readonly signingKeys: SigningKeyProvider,
++  ) {}
+ 
+   async create(dto: CreateBondDto): Promise<BondResponse> {
+     const adminSecret = this.getAdminSecret();
+@@ -116,7 +114,7 @@ export class BondsService {
+   }
+ 
+   async subscribe(id: number, dto: SubscribeDto): Promise<SubscriptionResponse> {
+-    const investorSecret = process.env.INVESTOR_SECRET_KEY || '';
++    const investorSecret = this.signingKeys.investorSecret();
+     const nonce = await this.nonceService.next(BOND_ISSUER(), dto.investorAddress);
+     const { transactionHash } = await this.contractService.invokeContractMethod(
+       BOND_ISSUER(), 'subscribe', investorSecret,
+@@ -181,7 +179,7 @@ export class BondsService {
+   }
+ 
+   async claimCredits(id: number, dto: ClaimCreditsDto): Promise<ClaimCreditsResponse> {
+-    const investorSecret = process.env.INVESTOR_SECRET_KEY || '';
++    const investorSecret = this.signingKeys.investorSecret();
+     const nonce = await this.nonceService.next(COUPON_ENGINE(), dto.investorAddress);
+ 
+     const { result, transactionHash } = await this.contractService.invokeContractMethod(
+@@ -202,7 +200,7 @@ export class BondsService {
+   }
+ 
+   async transfer(id: number, dto: TransferBondDto): Promise<TransferResponse> {
+-    const investorSecret = process.env.INVESTOR_SECRET_KEY || '';
++    const investorSecret = this.signingKeys.investorSecret();
+     const nonce = await this.nonceService.next(BOND_ISSUER(), dto.fromAddress);
+ 
+     const { transactionHash } = await this.contractService.invokeContractMethod(
+@@ -348,6 +346,6 @@ export class BondsService {
+   }
+ 
+   private getAdminSecret(): string {
+-    return process.env.ADMIN_SECRET_KEY || '';
++    return this.signingKeys.adminSecret();
+   }
+ }
+
+commit 59c9e07963c311ad1ee54df0118fdd87f53da394
+Author: legend-esc <ogazipromise82@gmail.com>
+Date:   Sun Aug 9 06:08:55 2026 +0100
+
+    fix(api): resolve lint errors and unused imports
+
+diff --git a/api/src/bonds/bonds.service.ts b/api/src/bonds/bonds.service.ts
+index d456d55..90bc6c6 100644
+--- a/api/src/bonds/bonds.service.ts
++++ b/api/src/bonds/bonds.service.ts
+@@ -1,5 +1,5 @@
+-import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
+-import { ContractService, ContractCallOptions } from '../stellar/contract.service';
++import { Injectable, BadRequestException } from '@nestjs/common';
++import { ContractService } from '../stellar/contract.service';
+ import { StellarService } from '../stellar/stellar.service';
+ import { NonceService } from '../common/services/nonce.service';
+ import { xdr, nativeToScVal, scValToNative, Address } from '@stellar/stellar-sdk';
+@@ -118,7 +118,7 @@ export class BondsService {
+   async subscribe(id: number, dto: SubscribeDto): Promise<SubscriptionResponse> {
+     const investorSecret = process.env.INVESTOR_SECRET_KEY || '';
+     const nonce = await this.nonceService.next(BOND_ISSUER(), dto.investorAddress);
+-    const { result, transactionHash } = await this.contractService.invokeContractMethod(
++    const { transactionHash } = await this.contractService.invokeContractMethod(
+       BOND_ISSUER(), 'subscribe', investorSecret,
+       [
+         Address.fromString(dto.investorAddress).toScVal(),
+
+commit 80ffaa62f3bbe85814a1a7255b5a713edb854926
+Author: NnamdiCyber <ogazi133@gmail.com>
+Date:   Sat Aug 8 15:19:06 2026 +0100
+
+    feat(api,ui): surface time-based bond maturity (#6)
+
+diff --git a/api/src/bonds/bonds.service.ts b/api/src/bonds/bonds.service.ts
+index c63f429..d456d55 100644
+--- a/api/src/bonds/bonds.service.ts
++++ b/api/src/bonds/bonds.service.ts
+@@ -1,4 +1,4 @@
+-import { Injectable, NotFoundException } from '@nestjs/common';
++import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
+ import { ContractService, ContractCallOptions } from '../stellar/contract.service';
+ import { StellarService } from '../stellar/stellar.service';
+ import { NonceService } from '../common/services/nonce.service';
+@@ -19,12 +19,26 @@ import {
+   UndistributedTotalResponse,
+   SweepUndistributedResponse,
+   BondStatusEnum,
++  BondMaturityStatusEnum,
+   CreditTypeEnum,
+ } from './interfaces/bond.interface';
+ 
+ const BOND_ISSUER = () => process.env.BOND_ISSUER_ADDRESS || '';
+ const COUPON_ENGINE = () => process.env.COUPON_ENGINE_ADDRESS || '';
+ 
++const BOND_ERROR_CODE = {
++  NotInitialized: 1,
++  Unauthorized: 2,
++  InvalidNonce: 3,
++  BondNotFound: 4,
++  BondAlreadyMatured: 5,
++  InsufficientSupply: 6,
++  ZeroAmount: 7,
++  ProjectNotApproved: 8,
++  Overflow: 9,
++  ReportNotVerified: 10,
++};
++
+ @Injectable()
+ export class BondsService {
+   private redis: RedisClientType;
+@@ -251,11 +265,15 @@ export class BondsService {
+     const adminAddress = this.stellarService.getKeypairFromSecret(adminSecret).publicKey();
+     const nonce = await this.nonceService.next(BOND_ISSUER(), adminAddress);
+ 
+-    await this.contractService.invokeContractMethod(
+-      BOND_ISSUER(), 'mature_bond', adminSecret,
+-      [Address.fromString(adminAddress).toScVal(), nativeToScVal(BigInt(id), { type: 'u64' })],
+-      nonce,
+-    );
++    try {
++      await this.contractService.invokeContractMethod(
++        BOND_ISSUER(), 'mature_bond', adminSecret,
++        [Address.fromString(adminAddress).toScVal(), nativeToScVal(BigInt(id), { type: 'u64' })],
++        nonce,
++      );
++    } catch (error) {
++      throw this.mapBondError(error, id);
++    }
+ 
+     await this.redis.del(`bond:${id}`);
+     return this.buildBondResponse(id);
+@@ -285,20 +303,50 @@ export class BondsService {
+     });
+     const state = scValToNative(stateScVal) as any[];
+ 
++    const status = state[1] as BondStatusEnum;
++    const maturityDate = Number(config[4]);
++    const nowSeconds = Math.floor(Date.now() / 1000);
++    const maturityStatus =
++      status === BondStatusEnum.Matured || nowSeconds >= maturityDate
++        ? BondMaturityStatusEnum.Matured
++        : BondMaturityStatusEnum.Active;
++
+     return {
+       id,
+       projectId: Buffer.from(config[0] as Uint8Array).toString('hex'),
+       faceValue: Number(config[1]),
+       couponSchedule: (config[2] as any[]).map((v: bigint) => Number(v)),
+       creditType: config[3] as CreditTypeEnum,
+-      maturityDate: Number(config[4]),
++      maturityDate,
++      maturityStatus,
+       totalSupply: Number(config[5]),
+       totalSubscribed: Number(state[0]),
+-      status: state[1] as BondStatusEnum,
++      status,
+       createdAt: new Date(Number(state[2]) * 1000).toISOString(),
+     };
+   }
+ 
++  private mapBondError(error: unknown, bondId: number): Error {
++    if (error instanceof BadRequestException) {
++      const message = error.message;
++      const match = message.match(/error code (\d+)/);
++      const code = match ? Number(match[1]) : undefined;
++
++      if (code === BOND_ERROR_CODE.Overflow) {
++        return new BadRequestException(
++          `Bond #${bondId} cannot be matured before its maturity date. ` +
++          'Maturation is only allowed once the maturity date has been reached.',
++        );
++      }
++
++      return error;
++    }
++    if (error instanceof Error) {
++      return new BadRequestException(error.message);
++    }
++    return new BadRequestException('Failed to mature bond');
++  }
++
+   private getAdminSecret(): string {
+     return process.env.ADMIN_SECRET_KEY || '';
+   }
+
+commit a8486faaf65cbf4468b6186bc82fd88763f7360e
+Author: Escelit <ogazipromise81@gmail.com>
+Date:   Sat Aug 8 08:08:30 2026 +0100
+
+    feat(api,ui): surface undistributed coupon dust (#5)
+
+diff --git a/api/src/bonds/bonds.service.ts b/api/src/bonds/bonds.service.ts
+index b63390f..c63f429 100644
+--- a/api/src/bonds/bonds.service.ts
++++ b/api/src/bonds/bonds.service.ts
+@@ -16,6 +16,8 @@ import {
+   CouponDistributionResponse,
+   ClaimCreditsResponse,
+   TransferResponse,
++  UndistributedTotalResponse,
++  SweepUndistributedResponse,
+   BondStatusEnum,
+   CreditTypeEnum,
+ } from './interfaces/bond.interface';
+@@ -211,6 +213,39 @@ export class BondsService {
+     };
+   }
+ 
++  async getUndistributedTotal(id: number): Promise<UndistributedTotalResponse> {
++    const resultScVal = await this.contractService.simulateCall({
++      contractAddress: COUPON_ENGINE(), method: 'get_undistributed_total',
++      args: [nativeToScVal(BigInt(id), { type: 'u64' })],
++    });
++
++    return {
++      bondId: id,
++      undistributedTotal: Number(scValToNative(resultScVal)),
++    };
++  }
++
++  async sweepUndistributed(id: number): Promise<SweepUndistributedResponse> {
++    const adminSecret = this.getAdminSecret();
++    const adminAddress = this.stellarService.getKeypairFromSecret(adminSecret).publicKey();
++    const nonce = await this.nonceService.next(COUPON_ENGINE(), adminAddress);
++
++    const { result, transactionHash } = await this.contractService.invokeContractMethod(
++      COUPON_ENGINE(), 'sweep_undistributed', adminSecret,
++      [
++        Address.fromString(adminAddress).toScVal(),
++        nativeToScVal(BigInt(id), { type: 'u64' }),
++      ],
++      nonce,
++    );
++
++    return {
++      bondId: id,
++      swept: Number(scValToNative(result)),
++      transactionHash: transactionHash || '',
++    };
++  }
++
+   async mature(id: number): Promise<BondResponse> {
+     const adminSecret = this.getAdminSecret();
+     const adminAddress = this.stellarService.getKeypairFromSecret(adminSecret).publicKey();
+
+commit 2ae56ab54fd89251be756ae6849ecdc7b5d2ef45
+Author: legend-esc <ogazipromise82@gmail.com>
+Date:   Wed Aug 5 13:41:04 2026 +0100
+
+    feat(api): align bond endpoints with new contract signatures
+
+diff --git a/api/src/bonds/bonds.service.ts b/api/src/bonds/bonds.service.ts
+index cd5223a..b63390f 100644
+--- a/api/src/bonds/bonds.service.ts
++++ b/api/src/bonds/bonds.service.ts
+@@ -7,11 +7,15 @@ import { createClient, RedisClientType } from '@redis/client';
+ import { CreateBondDto } from './dto/create-bond.dto';
+ import { SubscribeDto } from './dto/subscribe.dto';
+ import { DistributeCouponDto } from './dto/distribute-coupon.dto';
++import { ClaimCreditsDto } from './dto/claim-credits.dto';
++import { TransferBondDto } from './dto/transfer-bond.dto';
+ import {
+   BondResponse,
+   SubscriptionResponse,
+   HolderListResponse,
+   CouponDistributionResponse,
++  ClaimCreditsResponse,
++  TransferResponse,
+   BondStatusEnum,
+   CreditTypeEnum,
+ } from './interfaces/bond.interface';
+@@ -61,7 +65,7 @@ export class BondsService {
+ 
+     try {
+       const countScVal = await this.contractService.simulateCall({
+-        contractAddress: BOND_ISSUER(), method: 'total_subscribed', args: [],
++        contractAddress: BOND_ISSUER(), method: 'bond_count', args: [],
+       });
+       total = Number(scValToNative(countScVal));
+     } catch {}
+@@ -142,10 +146,11 @@ export class BondsService {
+     const { result } = await this.contractService.invokeContractMethod(
+       COUPON_ENGINE(), 'distribute_coupon', adminSecret,
+       [
++        Address.fromString(adminAddress).toScVal(),
+         nativeToScVal(BigInt(id), { type: 'u64' }),
+         nativeToScVal(dto.periodIndex, { type: 'u32' }),
+         xdr.ScVal.scvVec(holderAddresses.map((h) => Address.fromString(h).toScVal())),
+-        this.encodeOracleReport(dto.report),
++        nativeToScVal(BigInt(dto.reportId), { type: 'u64' }),
+       ],
+       nonce,
+     );
+@@ -159,6 +164,53 @@ export class BondsService {
+     };
+   }
+ 
++  async claimCredits(id: number, dto: ClaimCreditsDto): Promise<ClaimCreditsResponse> {
++    const investorSecret = process.env.INVESTOR_SECRET_KEY || '';
++    const nonce = await this.nonceService.next(COUPON_ENGINE(), dto.investorAddress);
++
++    const { result, transactionHash } = await this.contractService.invokeContractMethod(
++      COUPON_ENGINE(), 'claim_credits', investorSecret,
++      [
++        Address.fromString(dto.investorAddress).toScVal(),
++        nativeToScVal(BigInt(id), { type: 'u64' }),
++      ],
++      nonce,
++    );
++
++    return {
++      bondId: id,
++      investorAddress: dto.investorAddress,
++      credits: Number(scValToNative(result)),
++      transactionHash: transactionHash || '',
++    };
++  }
++
++  async transfer(id: number, dto: TransferBondDto): Promise<TransferResponse> {
++    const investorSecret = process.env.INVESTOR_SECRET_KEY || '';
++    const nonce = await this.nonceService.next(BOND_ISSUER(), dto.fromAddress);
++
++    const { transactionHash } = await this.contractService.invokeContractMethod(
++      BOND_ISSUER(), 'transfer', investorSecret,
++      [
++        Address.fromString(dto.fromAddress).toScVal(),
++        Address.fromString(dto.toAddress).toScVal(),
++        nativeToScVal(BigInt(id), { type: 'u64' }),
++        nativeToScVal(BigInt(dto.amount), { type: 'i128' }),
++      ],
++      nonce,
++    );
++
++    await this.redis.sAdd(`bond:${id}:holders`, dto.toAddress);
++
++    return {
++      bondId: id,
++      fromAddress: dto.fromAddress,
++      toAddress: dto.toAddress,
++      amount: dto.amount,
++      transactionHash: transactionHash || '',
++    };
++  }
++
+   async mature(id: number): Promise<BondResponse> {
+     const adminSecret = this.getAdminSecret();
+     const adminAddress = this.stellarService.getKeypairFromSecret(adminSecret).publicKey();
+@@ -185,18 +237,6 @@ export class BondsService {
+     ]);
+   }
+ 
+-  private encodeOracleReport(report: any): xdr.ScVal {
+-    return xdr.ScVal.scvVec([
+-      xdr.ScVal.scvBytes(Buffer.from(report.projectId, 'hex')),
+-      nativeToScVal(BigInt(report.periodStart), { type: 'u64' }),
+-      nativeToScVal(BigInt(report.periodEnd), { type: 'u64' }),
+-      nativeToScVal(BigInt(report.carbonSequestered), { type: 'i128' }),
+-      nativeToScVal(report.methodology, { type: 'symbol' }),
+-      xdr.ScVal.scvBytes(Buffer.from(report.providerSignature, 'hex')),
+-      xdr.ScVal.scvBytes(Buffer.from(report.ipfsEvidenceHash, 'hex')),
+-    ]);
+-  }
+-
+   private async buildBondResponse(id: number): Promise<BondResponse> {
+     const configScVal = await this.contractService.simulateCall({
+       contractAddress: BOND_ISSUER(), method: 'get_bond',
+
+commit e706e99a2debeb656f1c73c648af766a528a5392
+Author: legend-esc <ogazipromise82@gmail.com>
+Date:   Mon Aug 3 04:23:41 2026 +0100
+
+    fix(api): track nonces per contract and start from zero
+    
+    Contracts maintain a per-address, per-contract nonce starting at 0, but
+    the API kept a single redis counter per address that started at 1, so
+    every state-changing call was rejected with InvalidNonce. The client was
+    also expected to supply the current nonce, defeating replay protection.
+    
+    Introduce a shared NonceService that atomically increments a redis key
+    scoped to contract+address (INCR - 1 yields the next valid nonce). Wire
+    it into bonds, projects, dex, and oracle services so every call allocates
+    the correct nonce for the actor the contract tracks, and mark the client
+    nonce fields as optional across all DTOs.
+
+diff --git a/api/src/bonds/bonds.service.ts b/api/src/bonds/bonds.service.ts
+index 6ef3ff0..cd5223a 100644
+--- a/api/src/bonds/bonds.service.ts
++++ b/api/src/bonds/bonds.service.ts
+@@ -1,6 +1,7 @@
+ import { Injectable, NotFoundException } from '@nestjs/common';
+ import { ContractService, ContractCallOptions } from '../stellar/contract.service';
+ import { StellarService } from '../stellar/stellar.service';
++import { NonceService } from '../common/services/nonce.service';
+ import { xdr, nativeToScVal, scValToNative, Address } from '@stellar/stellar-sdk';
+ import { createClient, RedisClientType } from '@redis/client';
+ import { CreateBondDto } from './dto/create-bond.dto';
+@@ -25,6 +26,7 @@ export class BondsService {
+   constructor(
+     private readonly contractService: ContractService,
+     private readonly stellarService: StellarService,
++    private readonly nonceService: NonceService,
+   ) {
+     this.redis = createClient({ url: process.env.REDIS_URL || 'redis://localhost:6379' });
+     this.redis.connect().catch(() => {});
+@@ -33,7 +35,7 @@ export class BondsService {
+   async create(dto: CreateBondDto): Promise<BondResponse> {
+     const adminSecret = this.getAdminSecret();
+     const adminAddress = this.stellarService.getKeypairFromSecret(adminSecret).publicKey();
+-    const nonce = await this.getNonce(adminAddress);
++    const nonce = await this.nonceService.next(BOND_ISSUER(), adminAddress);
+ 
+     const configScVal = this.encodeBondConfig(dto);
+ 
+@@ -95,6 +97,7 @@ export class BondsService {
+ 
+   async subscribe(id: number, dto: SubscribeDto): Promise<SubscriptionResponse> {
+     const investorSecret = process.env.INVESTOR_SECRET_KEY || '';
++    const nonce = await this.nonceService.next(BOND_ISSUER(), dto.investorAddress);
+     const { result, transactionHash } = await this.contractService.invokeContractMethod(
+       BOND_ISSUER(), 'subscribe', investorSecret,
+       [
+@@ -102,7 +105,7 @@ export class BondsService {
+         nativeToScVal(BigInt(id), { type: 'u64' }),
+         nativeToScVal(BigInt(dto.amount), { type: 'i128' }),
+       ],
+-      dto.nonce,
++      nonce,
+     );
+ 
+     await this.redis.del(`bond:${id}`);
+@@ -132,7 +135,7 @@ export class BondsService {
+   async distributeCoupon(id: number, dto: DistributeCouponDto): Promise<CouponDistributionResponse> {
+     const adminSecret = this.getAdminSecret();
+     const adminAddress = this.stellarService.getKeypairFromSecret(adminSecret).publicKey();
+-    const nonce = await this.getNonce(adminAddress);
++    const nonce = await this.nonceService.next(COUPON_ENGINE(), adminAddress);
+ 
+     const holderAddresses = await this.redis.sMembers(`bond:${id}:holders`);
+ 
+@@ -159,7 +162,7 @@ export class BondsService {
+   async mature(id: number): Promise<BondResponse> {
+     const adminSecret = this.getAdminSecret();
+     const adminAddress = this.stellarService.getKeypairFromSecret(adminSecret).publicKey();
+-    const nonce = await this.getNonce(adminAddress);
++    const nonce = await this.nonceService.next(BOND_ISSUER(), adminAddress);
+ 
+     await this.contractService.invokeContractMethod(
+       BOND_ISSUER(), 'mature_bond', adminSecret,
+@@ -221,18 +224,6 @@ export class BondsService {
+     };
+   }
+ 
+-  private async getNonce(address: string): Promise<number> {
+-    try {
+-      const key = `nonce:${address}`;
+-      const stored = await this.redis.get(key);
+-      const next = (stored ? parseInt(stored, 10) : 0) + 1;
+-      await this.redis.set(key, next.toString());
+-      return next;
+-    } catch {
+-      return Math.floor(Date.now() / 1000);
+-    }
+-  }
+-
+   private getAdminSecret(): string {
+     return process.env.ADMIN_SECRET_KEY || '';
+   }
+
+commit 094332377ebb6dbcc9eef5c078aa0039f9d507ea
+Author: legend-esc <ogazipromise82@gmail.com>
+Date:   Thu Jun 11 22:16:22 2026 +0100
+
+    feat(api): Bonds and Projects CRUD modules with contract orchestration
+    
+    - Bonds module: create, list, detail, subscribe, holders, coupon
+      distribution, mature endpoints orchestrating BondIssuer and
+      CouponEngine contracts via ContractService
+    - Projects module: register (with IPFS metadata), list, detail,
+      approve, reject, document upload endpoints orchestrating
+      ProjectRegistry contract
+    - Pagination DTO and IsStellarAddress validator shared utilities
+    - IpfsService wrapping Pinata API for project metadata storage
+    - Redis caching for bond/project lookups with TTL-based invalidation
+
+diff --git a/api/src/bonds/bonds.service.ts b/api/src/bonds/bonds.service.ts
+new file mode 100644
+index 0000000..6ef3ff0
+--- /dev/null
++++ b/api/src/bonds/bonds.service.ts
+@@ -0,0 +1,239 @@
++import { Injectable, NotFoundException } from '@nestjs/common';
++import { ContractService, ContractCallOptions } from '../stellar/contract.service';
++import { StellarService } from '../stellar/stellar.service';
++import { xdr, nativeToScVal, scValToNative, Address } from '@stellar/stellar-sdk';
++import { createClient, RedisClientType } from '@redis/client';
++import { CreateBondDto } from './dto/create-bond.dto';
++import { SubscribeDto } from './dto/subscribe.dto';
++import { DistributeCouponDto } from './dto/distribute-coupon.dto';
++import {
++  BondResponse,
++  SubscriptionResponse,
++  HolderListResponse,
++  CouponDistributionResponse,
++  BondStatusEnum,
++  CreditTypeEnum,
++} from './interfaces/bond.interface';
++
++const BOND_ISSUER = () => process.env.BOND_ISSUER_ADDRESS || '';
++const COUPON_ENGINE = () => process.env.COUPON_ENGINE_ADDRESS || '';
++
++@Injectable()
++export class BondsService {
++  private redis: RedisClientType;
++
++  constructor(
++    private readonly contractService: ContractService,
++    private readonly stellarService: StellarService,
++  ) {
++    this.redis = createClient({ url: process.env.REDIS_URL || 'redis://localhost:6379' });
++    this.redis.connect().catch(() => {});
++  }
++
++  async create(dto: CreateBondDto): Promise<BondResponse> {
++    const adminSecret = this.getAdminSecret();
++    const adminAddress = this.stellarService.getKeypairFromSecret(adminSecret).publicKey();
++    const nonce = await this.getNonce(adminAddress);
++
++    const configScVal = this.encodeBondConfig(dto);
++
++    const { result } = await this.contractService.invokeContractMethod(
++      BOND_ISSUER(), 'issue_bond', adminSecret,
++      [Address.fromString(adminAddress).toScVal(), configScVal],
++      nonce,
++    );
++
++    const bondId = Number(scValToNative(result));
++    const bond = await this.buildBondResponse(bondId);
++    await this.redis.setEx(`bond:${bondId}`, 300, JSON.stringify(bond));
++    return bond;
++  }
++
++  async findAll(page = 1, limit = 20) {
++    const cacheKey = `bonds:${page}:${limit}`;
++    const cached = await this.redis.get(cacheKey);
++    if (cached) return JSON.parse(cached);
++
++    const bonds: BondResponse[] = [];
++    let total = 0;
++
++    try {
++      const countScVal = await this.contractService.simulateCall({
++        contractAddress: BOND_ISSUER(), method: 'total_subscribed', args: [],
++      });
++      total = Number(scValToNative(countScVal));
++    } catch {}
++
++    const start = (page - 1) * limit;
++    const end = Math.min(start + limit, total);
++
++    for (let id = 1; id <= total; id++) {
++      if (id > start && id <= end) {
++        try {
++          bonds.push(await this.buildBondResponse(id));
++        } catch {}
++      }
++    }
++
++    const result = {
++      data: bonds,
++      meta: { page, limit, total, totalPages: Math.ceil(total / limit) || 1 },
++    };
++
++    await this.redis.setEx(cacheKey, 60, JSON.stringify(result));
++    return result;
++  }
++
++  async findOne(id: number): Promise<BondResponse> {
++    const cached = await this.redis.get(`bond:${id}`);
++    if (cached) return JSON.parse(cached);
++
++    const bond = await this.buildBondResponse(id);
++    await this.redis.setEx(`bond:${id}`, 300, JSON.stringify(bond));
++    return bond;
++  }
++
++  async subscribe(id: number, dto: SubscribeDto): Promise<SubscriptionResponse> {
++    const investorSecret = process.env.INVESTOR_SECRET_KEY || '';
++    const { result, transactionHash } = await this.contractService.invokeContractMethod(
++      BOND_ISSUER(), 'subscribe', investorSecret,
++      [
++        Address.fromString(dto.investorAddress).toScVal(),
++        nativeToScVal(BigInt(id), { type: 'u64' }),
++        nativeToScVal(BigInt(dto.amount), { type: 'i128' }),
++      ],
++      dto.nonce,
++    );
++
++    await this.redis.del(`bond:${id}`);
++    await this.redis.sAdd(`bond:${id}:holders`, dto.investorAddress);
++
++    return { bondId: id, investorAddress: dto.investorAddress, amount: dto.amount, transactionHash: transactionHash || '' };
++  }
++
++  async getHolders(id: number): Promise<HolderListResponse> {
++    const holderAddresses = await this.redis.sMembers(`bond:${id}:holders`);
++    const holders = [];
++
++    for (const address of holderAddresses) {
++      try {
++        const balanceScVal = await this.contractService.simulateCall({
++          contractAddress: BOND_ISSUER(), method: 'get_holder_balance',
++          args: [nativeToScVal(BigInt(id), { type: 'u64' }), Address.fromString(address).toScVal()],
++        });
++        const balance = Number(scValToNative(balanceScVal));
++        if (balance > 0) holders.push({ address, balance });
++      } catch {}
++    }
++
++    return { bondId: id, holders, total: holders.length };
++  }
++
++  async distributeCoupon(id: number, dto: DistributeCouponDto): Promise<CouponDistributionResponse> {
++    const adminSecret = this.getAdminSecret();
++    const adminAddress = this.stellarService.getKeypairFromSecret(adminSecret).publicKey();
++    const nonce = await this.getNonce(adminAddress);
++
++    const holderAddresses = await this.redis.sMembers(`bond:${id}:holders`);
++
++    const { result } = await this.contractService.invokeContractMethod(
++      COUPON_ENGINE(), 'distribute_coupon', adminSecret,
++      [
++        nativeToScVal(BigInt(id), { type: 'u64' }),
++        nativeToScVal(dto.periodIndex, { type: 'u32' }),
++        xdr.ScVal.scvVec(holderAddresses.map((h) => Address.fromString(h).toScVal())),
++        this.encodeOracleReport(dto.report),
++      ],
++      nonce,
++    );
++
++    const parsed = scValToNative(result) as any[];
++    return {
++      bondId: id,
++      periodIndex: dto.periodIndex,
++      totalCredits: Number(parsed?.[2] ?? 0),
++      holderCount: Number(parsed?.[3] ?? 0),
++    };
++  }
++
++  async mature(id: number): Promise<BondResponse> {
++    const adminSecret = this.getAdminSecret();
++    const adminAddress = this.stellarService.getKeypairFromSecret(adminSecret).publicKey();
++    const nonce = await this.getNonce(adminAddress);
++
++    await this.contractService.invokeContractMethod(
++      BOND_ISSUER(), 'mature_bond', adminSecret,
++      [Address.fromString(adminAddress).toScVal(), nativeToScVal(BigInt(id), { type: 'u64' })],
++      nonce,
++    );
++
++    await this.redis.del(`bond:${id}`);
++    return this.buildBondResponse(id);
++  }
++
++  private encodeBondConfig(dto: CreateBondDto): xdr.ScVal {
++    return xdr.ScVal.scvVec([
++      xdr.ScVal.scvBytes(Buffer.from(dto.projectId, 'hex')),
++      nativeToScVal(BigInt(dto.faceValue), { type: 'i128' }),
++      xdr.ScVal.scvVec(dto.couponSchedule.map((ts) => nativeToScVal(BigInt(ts), { type: 'u64' }))),
++      nativeToScVal(dto.creditType, { type: 'symbol' }),
++      nativeToScVal(BigInt(dto.maturityDate), { type: 'u64' }),
++      nativeToScVal(BigInt(dto.totalSupply), { type: 'i128' }),
++    ]);
++  }
++
++  private encodeOracleReport(report: any): xdr.ScVal {
++    return xdr.ScVal.scvVec([
++      xdr.ScVal.scvBytes(Buffer.from(report.projectId, 'hex')),
++      nativeToScVal(BigInt(report.periodStart), { type: 'u64' }),
++      nativeToScVal(BigInt(report.periodEnd), { type: 'u64' }),
++      nativeToScVal(BigInt(report.carbonSequestered), { type: 'i128' }),
++      nativeToScVal(report.methodology, { type: 'symbol' }),
++      xdr.ScVal.scvBytes(Buffer.from(report.providerSignature, 'hex')),
++      xdr.ScVal.scvBytes(Buffer.from(report.ipfsEvidenceHash, 'hex')),
++    ]);
++  }
++
++  private async buildBondResponse(id: number): Promise<BondResponse> {
++    const configScVal = await this.contractService.simulateCall({
++      contractAddress: BOND_ISSUER(), method: 'get_bond',
++      args: [nativeToScVal(BigInt(id), { type: 'u64' })],
++    });
++    const config = scValToNative(configScVal) as any[];
++
++    const stateScVal = await this.contractService.simulateCall({
++      contractAddress: BOND_ISSUER(), method: 'get_bond_state',
++      args: [nativeToScVal(BigInt(id), { type: 'u64' })],
++    });
++    const state = scValToNative(stateScVal) as any[];
++
++    return {
++      id,
++      projectId: Buffer.from(config[0] as Uint8Array).toString('hex'),
++      faceValue: Number(config[1]),
++      couponSchedule: (config[2] as any[]).map((v: bigint) => Number(v)),
++      creditType: config[3] as CreditTypeEnum,
++      maturityDate: Number(config[4]),
++      totalSupply: Number(config[5]),
++      totalSubscribed: Number(state[0]),
++      status: state[1] as BondStatusEnum,
++      createdAt: new Date(Number(state[2]) * 1000).toISOString(),
++    };
++  }
++
++  private async getNonce(address: string): Promise<number> {
++    try {
++      const key = `nonce:${address}`;
++      const stored = await this.redis.get(key);
++      const next = (stored ? parseInt(stored, 10) : 0) + 1;
++      await this.redis.set(key, next.toString());
++      return next;
++    } catch {
++      return Math.floor(Date.now() / 1000);
++    }
++  }
++
++  private getAdminSecret(): string {
++    return process.env.ADMIN_SECRET_KEY || '';
++  }
++}
