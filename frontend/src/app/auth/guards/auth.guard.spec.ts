@@ -1,5 +1,5 @@
 import { TestBed } from '@angular/core/testing';
-import { Router, RouterStateSnapshot, UrlTree, provideRouter } from '@angular/router';
+import { Router, RouterStateSnapshot, UrlTree, provideRouter, RedirectCommand } from '@angular/router';
 import { Keypair } from '@stellar/stellar-sdk';
 import { adminGuard, authGuard, AUTH_REASON_PARAM, RETURN_URL_PARAM } from './auth.guard';
 import { WalletService } from '../wallet.service';
