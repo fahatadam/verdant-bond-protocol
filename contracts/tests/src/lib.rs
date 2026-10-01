@@ -713,6 +713,38 @@ mod integration {
     mod dex {
         use super::*;
 
+        fn configure_market(
+            env: &Env,
+            contracts: &TestContracts,
+            admin: &Address,
+            bond_id: u64,
+            price: i128,
+        ) {
+            let quote_asset = Symbol::new(env, "USDC");
+            contracts.dr_client.configure_market(
+                admin,
+                &bond_id,
+                &quote_asset,
+                &1,
+                &10_000,
+                &10_000,
+                &10_000,
+                &i128::MAX,
+                &3_600,
+                &60,
+                &0,
+            );
+            contracts.dr_client.update_oracle_reference(
+                admin,
+                &bond_id,
+                &quote_asset,
+                &price,
+                &env.ledger().timestamp(),
+                &1,
+                &1,
+            );
+        }
+
         #[test]
         fn test_full_settlement_with_seller_withdrawal() {
             let env = Env::default();
@@ -737,6 +769,7 @@ mod integration {
             let config = make_bond_config(&env, project_id, 10_000);
             let bond_id = contracts.bi_client.issue_bond(&admin, &config, &0);
             contracts.bi_client.subscribe(&alice, &bond_id, &5_000, &0);
+            configure_market(&env, &contracts, &admin, bond_id, 100);
 
             let order_id = contracts.dr_client.list_bond_tokens(
                 &alice,
@@ -811,6 +844,7 @@ mod integration {
             let config = make_bond_config(&env, project_id, 10_000);
             let bond_id = contracts.bi_client.issue_bond(&admin, &config, &0);
             contracts.bi_client.subscribe(&alice, &bond_id, &5_000, &0);
+            configure_market(&env, &contracts, &admin, bond_id, 100);
 
             let order_id = contracts.dr_client.list_bond_tokens(
                 &alice,
@@ -859,6 +893,7 @@ mod integration {
             let config = make_bond_config(&env, project_id, 10_000);
             let bond_id = contracts.bi_client.issue_bond(&admin, &config, &0);
             contracts.bi_client.subscribe(&alice, &bond_id, &5_000, &0);
+            configure_market(&env, &contracts, &admin, bond_id, 100);
 
             let order_id = contracts.dr_client.list_bond_tokens(
                 &alice,
@@ -914,6 +949,7 @@ mod integration {
             let config = make_bond_config(&env, project_id, 10_000);
             let bond_id = contracts.bi_client.issue_bond(&admin, &config, &0);
             contracts.bi_client.subscribe(&alice, &bond_id, &5_000, &0);
+            configure_market(&env, &contracts, &admin, bond_id, 100);
 
             let order_id = contracts.dr_client.list_bond_tokens(
                 &alice,
@@ -1060,9 +1096,8 @@ mod integration {
                 .distribute_coupon(&admin, &bond_id, &0, &holders, &report_id, &1);
 
             let total = 100 * nbbs_coupon_engine::CREDIT_MINOR_UNITS;
-            let credits_per_token = total * nbbs_coupon_engine::FIXED_POINT / 3;
             // each holder holds 1 token
-            let per_holder = credits_per_token / nbbs_coupon_engine::FIXED_POINT;
+            let per_holder = total / 3;
             let distributed = per_holder * 3;
 
             assert_eq!(result.total_credits, distributed);
@@ -1516,6 +1551,7 @@ mod integration {
                     .bi_client
                     .subscribe(&alice, &bond_id, &order_amount, &0);
 
+                configure_market(&env, &contracts, &admin, bond_id, price);
                 let quote = Symbol::new(&env, "USDC");
                 let order_id = contracts.dr_client.list_bond_tokens(
                     &alice,
@@ -1649,6 +1685,8 @@ mod integration {
 
                 let mut distributed = 0i128;
                 for (holder, &amount) in holders.iter().zip(balances.iter()) {
+                    let expected = total_credits * amount / total_subscribed;
+                    let accrued = contracts.ce_client.accrued_credits(&bond_id, holder);
                     let cpt = if total_credits > 0 {
                         total_credits * nbbs_coupon_engine::FIXED_POINT / total_subscribed
                     } else {
