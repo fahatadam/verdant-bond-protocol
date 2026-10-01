@@ -74,6 +74,7 @@ describe('OrderBookDepthComponent (#208)', () => {
     expect(component.flushCount()).toBe(base + 1);
     // Latest snapshot wins: single level at price 10 with the last size.
     expect(component.asks()).toEqual([{ price: 10, size: 50, total: 50 }]);
+    fixture.destroy(); // stops the depth poll timer
   }));
 
   it('shows a stale/reconnecting indicator after consecutive stream failures and backfills on recovery', fakeAsync(() => {
@@ -95,6 +96,7 @@ describe('OrderBookDepthComponent (#208)', () => {
     expect(component.stale()).toBe(false);
     expect(component.reconnecting()).toBe(false);
     expect(component.asks()).toEqual([{ price: 10, size: 9, total: 9 }]);
+    fixture.destroy(); // stops the depth poll timer
   }));
 
   it('uses a stable trackBy identity per price level', () => {

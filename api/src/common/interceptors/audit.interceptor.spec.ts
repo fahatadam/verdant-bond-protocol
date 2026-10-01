@@ -18,7 +18,7 @@ describe('AuditInterceptor', () => {
     const mockRequest = {
       method: 'POST',
       url: '/api/v1/bonds',
-      user: { sub: 'admin-user' },
+      user: { walletAddress: 'GADMIN' },
       body: { title: 'Green Bond', password: 'secret-password' },
     };
 
@@ -36,9 +36,10 @@ describe('AuditInterceptor', () => {
       expect(auditService.record).toHaveBeenCalledWith({
         entityType: 'http_request',
         entityId: '/api/v1/bonds',
-        principal: 'admin-user',
+        actor: 'GADMIN',
         action: 'POST',
-        payload: JSON.stringify({ title: 'Green Bond' }), // password should be stripped
+        before: null,
+        after: { title: 'Green Bond' }, // password should be stripped
       });
       done();
     });

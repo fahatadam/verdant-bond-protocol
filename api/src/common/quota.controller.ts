@@ -3,7 +3,7 @@ import { QuotaService } from './services/quota.service';
 import { JwtAuthGuard } from './guards/jwt-auth.guard';
 import { PermissionsGuard } from './guards/permissions.guard';
 import { RequirePermissions } from './decorators/permissions.decorator';
-import { Permission } from '../../auth/rbac';
+import { Permission } from '../auth/rbac';
 
 @Controller('quota')
 export class QuotaController {

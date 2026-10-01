@@ -8,8 +8,8 @@
  */
 
 import { Injectable, Logger, BadRequestException, ForbiddenException } from '@nestjs/common';
-import { RedisService } from './redis.service';
-import { ConfigService } from '../config/config.service';
+import { RedisService } from '../services/redis.service';
+import { ConfigService } from '../../config/config.service';
 
 /**
  * Visibility levels for indexed records.
@@ -127,6 +127,8 @@ export class SearchIndexService {
   private readonly logger = new Logger(SearchIndexService.name);
   private readonly INDEX_PREFIX = 'search:index:';
   private readonly VISIBILITY_PREFIX = 'search:visibility:';
+  /** One set per entity type listing its index keys; every reader walks it. */
+  private readonly MEMBERS_PREFIX = 'search:members:';
 
   constructor(
     private readonly redis: RedisService,
@@ -144,6 +146,7 @@ export class SearchIndexService {
 
     await this.redis.setEx(key, 3600, JSON.stringify(entry));
     await this.redis.setEx(visibilityKey, 3600, entry.visibility);
+    await this.redis.sAdd(this.getMembersKey(entry.entityType), key);
 
     this.logger.log(`Index entry upserted for ${entry.entityType}:${entry.recordId} with visibility ${entry.visibility}`);
   }
@@ -173,8 +176,7 @@ export class SearchIndexService {
     limit = 20,
     permissionChecker: PermissionChecker = defaultPermissionChecker,
   ): Promise<SearchResult> {
-    const pattern = `${this.INDEX_PREFIX}${entityType}:*`;
-    const keys = await this.redis.sMembers(pattern.replace('search:', ''));
+    const keys = await this.redis.sMembers(this.getMembersKey(entityType));
     const entries: IndexEntry[] = [];
 
     for (const key of keys) {
@@ -215,8 +217,7 @@ export class SearchIndexService {
    * Get all entries for a specific entity type (admin-only).
    */
   async getAll(entityType: EntityType): Promise<IndexEntry[]> {
-    const pattern = `${this.INDEX_PREFIX}${entityType}:*`;
-    const keys = await this.redis.sMembers(pattern.replace('search:', ''));
+    const keys = await this.redis.sMembers(this.getMembersKey(entityType));
     const entries: IndexEntry[] = [];
 
     for (const key of keys) {
@@ -310,7 +311,7 @@ export class SearchIndexService {
     getRecordState: (recordId: string) => Promise<{ isActive: boolean; isDeleted: boolean; ownerAddress?: string }>,
   ): Promise<RepairResult> {
     const result: RepairResult = { repaired: 0, removed: 0, errors: [] };
-    const allKeys = await this.redis.sMembers(entityType);
+    const allKeys = await this.redis.sMembers(this.getMembersKey(entityType));
 
     for (const key of allKeys) {
       try {
@@ -355,7 +356,11 @@ export class SearchIndexService {
     const forbidden = [VisibilityLevel.HIDDEN, VisibilityLevel.REVOKED, VisibilityLevel.DELETED];
     let removed = 0;
 
-    const allKeys = await this.redis.sMembers('search:index:*');
+    const allKeys = (
+      await Promise.all(
+        Object.values(EntityType).map((type) => this.redis.sMembers(this.getMembersKey(type))),
+      )
+    ).flat();
     for (const key of allKeys) {
       try {
         const raw = await this.redis.get(key);
@@ -376,6 +381,10 @@ export class SearchIndexService {
 
   private getIndexKey(entityType: EntityType, recordId: string): string {
     return `${this.INDEX_PREFIX}${entityType}:${recordId}`;
+  }
+
+  private getMembersKey(entityType: EntityType): string {
+    return `${this.MEMBERS_PREFIX}${entityType}`;
   }
 
   private getVisibilityKey(entityType: EntityType, recordId: string): string {

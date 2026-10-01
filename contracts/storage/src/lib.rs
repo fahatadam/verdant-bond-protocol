@@ -189,19 +189,19 @@ pub fn generate_storage_fixtures(
         ),
     );
     coupon_engine.insert(
-        "AccruedCredits(1, addr)".to_string(),
+        "EscrowedCredits(1, addr)".to_string(),
         fx(
-            "AccruedCredits(1, addr)",
-            encode(env, CouponEngineKey::AccruedCredits(1, addr.clone())),
+            "EscrowedCredits(1, addr)",
+            encode(env, CouponEngineKey::EscrowedCredits(1, addr.clone())),
         ),
     );
     coupon_engine.insert(
-        "AccruedCreditsByType(1, addr, Carbon)".to_string(),
+        "EscrowedCreditsByType(1, addr, Carbon)".to_string(),
         fx(
-            "AccruedCreditsByType(1, addr, Carbon)",
+            "EscrowedCreditsByType(1, addr, Carbon)",
             encode(
                 env,
-                CouponEngineKey::AccruedCreditsByType(1, addr.clone(), CreditType::Carbon),
+                CouponEngineKey::EscrowedCreditsByType(1, addr.clone(), CreditType::Carbon),
             ),
         ),
     );
@@ -561,7 +561,10 @@ pub fn generate_storage_fixtures(
     );
     oracle_consumer.insert(
         "MinimumQuorum".to_string(),
-        fx("MinimumQuorum", encode(env, OracleConsumerKey::MinimumQuorum)),
+        fx(
+            "MinimumQuorum",
+            encode(env, OracleConsumerKey::MinimumQuorum),
+        ),
     );
     oracle_consumer.insert(
         "MinimumDisputeBond".to_string(),

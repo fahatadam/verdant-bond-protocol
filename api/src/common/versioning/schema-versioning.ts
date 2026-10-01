@@ -226,18 +226,11 @@ export function applyWriteTransforms<T>(
   toVersion: SchemaVersion,
   transforms: CompatibilityRegistry,
 ): T {
-  const versionOrder = [SchemaVersion.V1_0_0, SchemaVersion.V1_1_0, SchemaVersion.V1_2_0, SchemaVersion.V2_0_0];
-  let currentData = data;
-  const toIndex = versionOrder.indexOf(toVersion);
-
-  for (let i = versionOrder.length - 1; i > toIndex; i--) {
-    const targetVer = versionOrder[i];
-    const transform = transforms.writeTransforms.find((t) => t.toVersion === targetVer);
-    if (transform) {
-      currentData = transform.transform(currentData);
-    }
-  }
-  return currentData as T;
+  // Each write transform maps the latest shape directly to its target version,
+  // so exactly one applies; chaining them would feed one version's output into
+  // a transform that expects the latest shape. The latest version needs none.
+  const transform = transforms.writeTransforms.find((t) => t.toVersion === toVersion);
+  return (transform ? transform.transform(data) : data) as T;
 }
 
 /**

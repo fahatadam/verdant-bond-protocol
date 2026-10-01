@@ -10,30 +10,20 @@ import { PortfolioModule } from './portfolio/portfolio.module';
 import { StellarModule } from './stellar/stellar.module';
 import { SeedModule } from './seed/seed.module';
 import { ConfigModule } from './config/config.module';
+import { ValuationModule } from './valuation/valuation.module';
 import { Rfc7807ExceptionFilter } from './common/filters/rfc7807-exception.filter';
 import { RequestLoggingInterceptor } from './common/interceptors/request-logging.interceptor';
 import { RateLimitGuard } from './common/guards/rate-limit.guard';
 import { AuditInterceptor } from './common/interceptors/audit.interceptor';
 import { IdempotencyInterceptor } from './common/interceptors/idempotency.interceptor';
-import { TelemetryInterceptor } from './common/interceptors/telemetry.interceptor';
-import { QuotaGuard } from './common/guards/quota.guard';
-import { WorkersModule } from './workers/workers.module';
-import { ReconciliationModule } from './reconciliation/reconciliation.module';
-import { ExportsModule } from './exports/exports.module';
-import { ComplianceModule } from './compliance/compliance.module';
-import { AuditModule } from './audit/audit.module';
-import { RecoveryModule } from './recovery/recovery.module';
-import { MigrationSafetyModule } from './migrations/migration-safety.module';
-import { ImpersonationModule } from './impersonation/impersonation.module';
-import { InvitationsModule } from './invitations/invitations.module';
-import { FailuresModule } from './failures/failures.module';
-import { NotificationsModule } from './notifications/notifications.module';
+import { OpsModule } from './ops/ops.module';
 
 @Module({
   imports: [
     CommonModule,
     ConfigModule,
     BondsModule,
+    OpsModule,
     ProjectsModule,
     OracleModule,
     MarketplaceModule,
@@ -41,6 +31,7 @@ import { NotificationsModule } from './notifications/notifications.module';
     PortfolioModule,
     StellarModule,
     SeedModule,
+    ValuationModule,
     WorkersModule,
     ReconciliationModule,
     ExportsModule,
@@ -52,6 +43,9 @@ import { NotificationsModule } from './notifications/notifications.module';
     InvitationsModule,
     FailuresModule,
     NotificationsModule,
+    FeesModule,
+    AuthorizationsModule,
+    StatusModule,
   ],
   providers: [
     { provide: APP_FILTER, useClass: Rfc7807ExceptionFilter },

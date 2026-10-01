@@ -9,13 +9,24 @@
 import { EnvConfigValidator, EnvConfig, WEAK_SECRET_PATTERNS } from './env-config.validator';
 import { ConfigService } from '../../config/config.service';
 
+/** Valid Soroban contract IDs (checksummed C… strkeys). */
+const CONTRACT = {
+  BOND: 'CBBE6TSEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABHW4',
+  COUPON: 'CBBU6VKQJ5HAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAHJ',
+  REG: 'CBJEKRYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABJ2Z',
+  ORACLE: 'CBHVEQKDJRCQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA7QA',
+  DEX: 'CBCEKWAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAV4',
+  CREDIT: 'CBBVERKEJFKAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWVM',
+  GOV: 'CBDU6VQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAATIU',
+};
+
 const MOCK_CONFIG = {
-  getBondIssuerAddress: jest.fn().mockReturnValue('CBOND'),
-  getCouponEngineAddress: jest.fn().mockReturnValue('CCOUPON'),
-  getCreditRetirementAddress: jest.fn().mockReturnValue('CCREDIT'),
-  getDexRouterAddress: jest.fn().mockReturnValue('CDEX'),
-  getProjectRegistryAddress: jest.fn().mockReturnValue('CREG'),
-  getOracleConsumerAddress: jest.fn().mockReturnValue('CORACLE'),
+  getBondIssuerAddress: jest.fn().mockReturnValue(CONTRACT.BOND),
+  getCouponEngineAddress: jest.fn().mockReturnValue(CONTRACT.COUPON),
+  getCreditRetirementAddress: jest.fn().mockReturnValue(CONTRACT.CREDIT),
+  getDexRouterAddress: jest.fn().mockReturnValue(CONTRACT.DEX),
+  getProjectRegistryAddress: jest.fn().mockReturnValue(CONTRACT.REG),
+  getOracleConsumerAddress: jest.fn().mockReturnValue(CONTRACT.ORACLE),
   getJwtSecret: jest.fn().mockReturnValue('test-jwt-secret-must-be-long-enough-32chars-min'),
   getJwtRefreshSecret: jest.fn().mockReturnValue('test-jwt-refresh-secret-min-32characters'),
   getJwtExpiry: jest.fn().mockReturnValue('15m'),
@@ -26,23 +37,23 @@ function setEnv(overrides: Record<string, string> = {}): void {
   process.env.STELLAR_NETWORK = 'testnet';
   process.env.STELLAR_HORIZON_URL = 'https://horizon-testnet.stellar.org';
   process.env.SOROBAN_RPC_URL = 'https://soroban-testnet.stellar.org';
-  process.env.BOND_ISSUER_ADDRESS = 'CBOND';
-  process.env.COUPON_ENGINE_ADDRESS = 'CCOUPON';
-  process.env.PROJECT_REGISTRY_ADDRESS = 'CREG';
-  process.env.ORACLE_CONSUMER_ADDRESS = 'CORACLE';
-  process.env.DEX_ROUTER_ADDRESS = 'CDEX';
-  process.env.CREDIT_RETIREMENT_ADDRESS = 'CCREDIT';
-  process.env.GOVERNANCE_ADDRESS = 'CGOV';
+  process.env.BOND_ISSUER_ADDRESS = CONTRACT.BOND;
+  process.env.COUPON_ENGINE_ADDRESS = CONTRACT.COUPON;
+  process.env.PROJECT_REGISTRY_ADDRESS = CONTRACT.REG;
+  process.env.ORACLE_CONSUMER_ADDRESS = CONTRACT.ORACLE;
+  process.env.DEX_ROUTER_ADDRESS = CONTRACT.DEX;
+  process.env.CREDIT_RETIREMENT_ADDRESS = CONTRACT.CREDIT;
+  process.env.GOVERNANCE_ADDRESS = CONTRACT.GOV;
   process.env.REDIS_URL = 'redis://localhost:6379';
   process.env.DATABASE_URL = 'postgresql://user:pass@localhost:5432/test';
-  process.env.JWT_SECRET = 'a-very-strong-secret-that-is-definitely-over-32-characters-long';
-  process.env.JWT_REFRESH_SECRET = 'a-very-strong-refresh-secret-over-32-characters-abc123';
-  process.env.ADMIN_SECRET_KEY = 'a-very-strong-admin-secret-over-32-characters-long';
-  process.env.INVESTOR_SECRET_KEY = 'a-very-strong-investor-secret-over-32-characters';
-  process.env.USER_SECRET_KEY = 'a-very-strong-user-secret-over-32-characters';
+  process.env.JWT_SECRET = 'Zq7vN2kLp9xRw4tYh8mB3cF6gJ1sD5aE0uWiKoQe';
+  process.env.JWT_REFRESH_SECRET = 'Hn4bV8cX2zM6lK9jG3fD7sA1qW5eR0tYuIoPkLmN';
+  process.env.ADMIN_SECRET_KEY = 'Pw3oE7iR1uT5yQ9aS2dF6gH0jK4lZ8xCvBnMqWeR';
+  process.env.INVESTOR_SECRET_KEY = 'Lk8jH2gF6dS0aQ4wE9rT3yU7iO1pZ5xCvBnMmQwE';
+  process.env.USER_SECRET_KEY = 'Mn5bV9cX3zL7kJ1hG6fD0sA4qW8eR2tYuIoPaSdF';
   process.env.IPFS_API_URL = 'https://api.pinata.cloud';
   process.env.IPFS_API_KEY = 'pinata-key';
-  process.env.IPFS_SECRET_KEY = 'pinata-secret-over-32-chars-long';
+  process.env.IPFS_SECRET_KEY = 'Rt6yU0iO4pA8sD2fG7hJ1kL5zX9cV3bNmPzXcVbN';
   process.env.ORACLE_PROVIDER_WHITELIST = 'GPROV';
   process.env.PORT = '3000';
   process.env.NODE_ENV = 'test';
@@ -224,11 +235,11 @@ describe('EnvConfigValidator (#278)', () => {
 
     it('passes when all secrets are strong', () => {
       setEnv({
-        JWT_SECRET: 'a-very-strong-secret-that-is-definitely-over-32-characters-long',
-        JWT_REFRESH_SECRET: 'a-very-strong-refresh-secret-over-32-characters-abc123',
-        ADMIN_SECRET_KEY: 'a-very-strong-admin-secret-over-32-characters-long',
-        INVESTOR_SECRET_KEY: 'a-very-strong-investor-secret-over-32-characters',
-        USER_SECRET_KEY: 'a-very-strong-user-secret-over-32-characters',
+        JWT_SECRET: 'Zq7vN2kLp9xRw4tYh8mB3cF6gJ1sD5aE0uWiKoQe',
+        JWT_REFRESH_SECRET: 'Hn4bV8cX2zM6lK9jG3fD7sA1qW5eR0tYuIoPkLmN',
+        ADMIN_SECRET_KEY: 'Pw3oE7iR1uT5yQ9aS2dF6gH0jK4lZ8xCvBnMqWeR',
+        INVESTOR_SECRET_KEY: 'Lk8jH2gF6dS0aQ4wE9rT3yU7iO1pZ5xCvBnMmQwE',
+        USER_SECRET_KEY: 'Mn5bV9cX3zL7kJ1hG6fD0sA4qW8eR2tYuIoPaSdF',
       });
       const configService = MOCK_CONFIG;
       validator = new EnvConfigValidator(configService as any);
@@ -264,7 +275,7 @@ describe('EnvConfigValidator (#278)', () => {
       validator = new EnvConfigValidator(configService as any);
       const config = validator.getConfig();
       expect(config.stellarNetwork).toBe('testnet');
-      expect(config.bondIssuerAddress).toBe('CBOND');
+      expect(config.bondIssuerAddress).toBe(CONTRACT.BOND);
       expect(config.port).toBe(3000);
       expect(config.nodeEnv).toBe('test');
     });
@@ -280,17 +291,18 @@ describe('EnvConfigValidator (#278)', () => {
 
   describe('maskSecret', () => {
     it('masks a secret with visible characters at ends', () => {
-      const secret = 'a-very-strong-secret-that-is-definitely-over-32-characters-long';
+      const secret = 'Zq7vN2kLp9xRw4tYh8mB3cF6gJ1sD5aE0uWiKoQe';
       const masked = validator.maskSecret(secret);
       expect(masked).not.toEqual(secret);
       expect(masked.length).toBe(secret.length);
-      expect(masked.startsWith('a-ver')).toBe(true);
-      expect(masked.endsWith('ong')).toBe(true);
+      // Four characters stay visible at each end.
+      expect(masked.startsWith('Zq7v')).toBe(true);
+      expect(masked.endsWith('KoQe')).toBe(true);
     });
 
     it('masks short secrets completely', () => {
       const masked = validator.maskSecret('short');
-      expect(masked).toBe('****');
+      expect(masked).toBe('*****');
     });
   });
 

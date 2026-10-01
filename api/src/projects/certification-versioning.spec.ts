@@ -1,5 +1,6 @@
 import { ProjectsService } from './projects.service';
 import { decodeCid } from '../common/utils';
+import { nativeToScVal, xdr } from '@stellar/stellar-sdk';
 
 function memoryRedis() {
   const store = new Map<string, string>();
@@ -25,8 +26,11 @@ function serviceWith(redis: any, periodInfo: any[], report: any[]) {
   );
   (svc as any).redis = redis;
   (svc as any).contractService = {
+    // simulateCall returns an ScVal; the service decodes it with scValToNative.
     simulateCall: jest.fn(async ({ method }: any) =>
-      method === 'get_period_info' ? periodInfo : report,
+      xdr.ScVal.scvVec(
+        (method === 'get_period_info' ? periodInfo : report).map((v) => nativeToScVal(v)),
+      ),
     ),
   };
   (svc as any).configService = {

@@ -8,12 +8,13 @@
  */
 
 import { Injectable, OnModuleInit, BadRequestException, Logger } from '@nestjs/common';
-import { ConfigService as NestConfigService } from '../config/config.service';
+import { StrKey } from '@stellar/stellar-sdk';
+import { ConfigService as NestConfigService } from '../../config/config.service';
 
 const MIN_SECRET_LENGTH = 32;
 const MAX_SECRET_LENGTH = 256;
 
-const WEAK_SECRET_PATTERNS = [
+export const WEAK_SECRET_PATTERNS = [
   'dev-secret',
   'secret',
   'password',
@@ -63,19 +64,19 @@ const REQUIRED_ENV_VARS = [
 
 type RequiredEnvVar = typeof REQUIRED_ENV_VARS[number];
 
-interface EnvValidationResult {
+export interface EnvValidationResult {
   valid: boolean;
   errors: EnvValidationError[];
   warnings: EnvValidationWarning[];
 }
 
-interface EnvValidationError {
+export interface EnvValidationError {
   field: string;
   message: string;
   code: string;
 }
 
-interface EnvValidationWarning {
+export interface EnvValidationWarning {
   field: string;
   message: string;
   code: string;
@@ -248,10 +249,10 @@ export class EnvConfigValidator implements OnModuleInit {
     ];
     for (const varName of contractFields) {
       const value = process.env[varName];
-      if (value && !this.isStellarAddress(value)) {
+      if (value && !this.isContractAddress(value)) {
         errors.push({
           field: varName,
-          message: `${varName} is not a valid Stellar address: ${value}`,
+          message: `${varName} is not a valid Soroban contract address: ${value}`,
           code: 'INVALID_CONTRACT_ADDRESS',
         });
       }
@@ -379,8 +380,9 @@ export class EnvConfigValidator implements OnModuleInit {
   /**
    * Check if a value is a valid Stellar address.
    */
-  private isStellarAddress(value: string): boolean {
-    return value.startsWith('G') && value.length === 56;
+  // Soroban contract IDs are C… strkeys (G… is an account key).
+  private isContractAddress(value: string): boolean {
+    return StrKey.isValidContract(value);
   }
 
   /**

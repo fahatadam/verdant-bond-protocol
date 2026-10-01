@@ -20,16 +20,17 @@
  * - INV-011: bond ID is a positive integer
  */
 
+import { KycStatus } from '../interfaces/authenticated-request.interface';
 import { Test, TestingModule } from '@nestjs/testing';
-import { BondsService } from '../bonds/bonds.service';
-import { ContractService } from '../stellar/contract.service';
-import { StellarService } from '../stellar/stellar.service';
-import { NonceService } from '../common/services/nonce.service';
-import { RedisService } from '../common/services/redis.service';
-import { SigningKeyProvider } from '../common/services/signing-key.provider';
-import { ConfigService } from '../config/config.service';
-import { HolderIndexService } from '../bonds/holder-index.service';
-import { KycService } from '../auth/kyc.service';
+import { BondsService } from '../../bonds/bonds.service';
+import { ContractService } from '../../stellar/contract.service';
+import { StellarService } from '../../stellar/stellar.service';
+import { NonceService } from '../services/nonce.service';
+import { RedisService } from '../services/redis.service';
+import { SigningKeyProvider } from '../services/signing-key.provider';
+import { ConfigService } from '../../config/config.service';
+import { HolderIndexService } from '../../bonds/holder-index.service';
+import { KycService } from '../../auth/kyc.service';
 import {
   bondLifecycleInvariants,
   ownershipInvariants,
@@ -37,8 +38,8 @@ import {
   dataIntegrityInvariants,
   runAllInvariants,
   InvariantResult,
-} from './invariants/domain-invariants';
-import { BondStatusEnum, BondMaturityStatusEnum, CreditTypeEnum } from '../bonds/interfaces/bond.interface';
+} from './domain-invariants';
+import { BondStatusEnum, BondMaturityStatusEnum, CreditTypeEnum } from '../../bonds/interfaces/bond.interface';
 
 jest.mock('@redis/client', () => {
   const mockClient = {
@@ -53,7 +54,7 @@ jest.mock('@redis/client', () => {
   return { createClient: jest.fn().mockReturnValue(mockClient) };
 });
 
-jest.mock('./holder-index.service', () => ({
+jest.mock('../../bonds/holder-index.service', () => ({
   HolderIndexService: jest.fn().mockImplementation(() => ({
     recordSubscribe: jest.fn().mockResolvedValue(undefined),
     recordTransfer: jest.fn().mockResolvedValue(undefined),
@@ -65,7 +66,7 @@ jest.mock('./holder-index.service', () => ({
   })),
 }));
 
-jest.mock('../auth/kyc.service', () => ({
+jest.mock('../../auth/kyc.service', () => ({
   KycService: jest.fn().mockImplementation(() => ({
     getStatus: jest.fn().mockResolvedValue('verified'),
     isEligibleRecord: jest.fn().mockResolvedValue({ eligible: true, record: { status: 'verified' } }),
@@ -301,9 +302,7 @@ describe('Domain Invariant Test Suite (#262)', () => {
 
   describe('INV-008: only KYC-verified investors can subscribe', () => {
     it('passes for verified status', async () => {
-      const kycService = moduleRef.get(KycService);
-      jest.spyOn(kycService, 'getStatus').mockResolvedValue('verified');
-      const result = await accessControlInvariants.subscriberIsKycVerified('verified');
+      const result = await accessControlInvariants.subscriberIsKycVerified(KycStatus.VERIFIED);
       expect(result.passed).toBe(true);
     });
 

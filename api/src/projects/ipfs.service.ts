@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Inject, Injectable, Optional } from '@nestjs/common';
 import { createHash } from 'crypto';
 import { IpfsUploadPolicy } from './ipfs-upload.policy';
 
@@ -33,6 +33,9 @@ type FetchFn = (
   init?: RequestInit,
 ) => Promise<{ ok: boolean; status: number; statusText: string; json(): Promise<any>; arrayBuffer(): Promise<ArrayBuffer> }>;
 
+/** Optional override for the HTTP client (tests); production uses global fetch. */
+export const IPFS_FETCH = Symbol('IPFS_FETCH');
+
 const defaultFetch: FetchFn = (url, init) =>
   fetch(url, init) as unknown as Promise<{
     ok: boolean;
@@ -53,7 +56,7 @@ export class IpfsService {
 
   constructor(
     private readonly uploadPolicy: IpfsUploadPolicy,
-    private readonly fetchFn: FetchFn = defaultFetch,
+    @Optional() @Inject(IPFS_FETCH) private readonly fetchFn: FetchFn = defaultFetch,
   ) {}
 
   /** Primary + secondary pinning providers (issue #211). Secondary is

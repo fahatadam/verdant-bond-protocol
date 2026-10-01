@@ -17,7 +17,6 @@ import {
   validateRecordSchema,
   checkCompatibility,
   bondSchemaTransforms,
-  BondResponse,
 } from './schema-versioning';
 
 describe('Schema Versioning Compatibility Layer (#276)', () => {
@@ -127,7 +126,7 @@ describe('Schema Versioning Compatibility Layer (#276)', () => {
         totalSupply: '5000',
       };
 
-      const result = applyReadTransforms(v12Record, SchemaVersion.V1_2_0, bondSchemaTransforms);
+      const result = applyReadTransforms<Record<string, any>>(v12Record, SchemaVersion.V1_2_0, bondSchemaTransforms);
       expect(result.projectRegistryId).toBe('def456');
       expect(result.status).toBe('Active');
     });
@@ -148,7 +147,7 @@ describe('Schema Versioning Compatibility Layer (#276)', () => {
         maturityStatus: 'Active',
       };
 
-      const result = applyWriteTransforms(latestRecord, SchemaVersion.V1_0_0, bondSchemaTransforms);
+      const result = applyWriteTransforms<Record<string, any>>(latestRecord, SchemaVersion.V1_0_0, bondSchemaTransforms);
       expect(result.projectId).toBe('abc123');
       expect(result.projectRegistryId).toBeUndefined();
     });
@@ -167,7 +166,7 @@ describe('Schema Versioning Compatibility Layer (#276)', () => {
         maturityStatus: 'Active',
       };
 
-      const result = applyWriteTransforms(latestRecord, SchemaVersion.V1_1_0, bondSchemaTransforms);
+      const result = applyWriteTransforms<Record<string, any>>(latestRecord, SchemaVersion.V1_1_0, bondSchemaTransforms);
       expect(result.projectId).toBe('abc123');
       expect(result.projectRegistryId).toBeUndefined();
     });
@@ -230,7 +229,7 @@ describe('Schema Versioning Compatibility Layer (#276)', () => {
       const result = validateRecordSchema(record);
       expect(result.supported).toBe(true);
 
-      const transformed = applyReadTransforms(record.data, record.metadata.version, bondSchemaTransforms);
+      const transformed = applyReadTransforms<Record<string, any>>(record.data, record.metadata.version, bondSchemaTransforms);
       expect(transformed.totalSubscribed).toBe('0');
       expect(transformed.projectRegistryId).toBe('a1b2');
     });

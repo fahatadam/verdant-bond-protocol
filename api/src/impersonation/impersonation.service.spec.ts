@@ -107,7 +107,51 @@ describe('ImpersonationService (#264)', () => {
       const decision = await service.performOperation(session.sessionId, 'bond.read');
 
       expect(decision.allowed).toBe(false);
-      expect(decision.denialReason).toBe('revoked');
+      expect(decision.denialReason).toBe('session_ended');
+    });
+
+    it('a revoked session reports "revoked", distinct from an explicit end or an expiry', async () => {
+      const revoked = await startSession();
+      const ended = await startSession();
+      const lapsed = await startSession({ ttlSeconds: 60, now: new Date('2026-01-01T00:00:00Z') });
+
+      await service.revoke(revoked.sessionId, ADMIN);
+      await service.end(ended.sessionId, ADMIN);
+      await service.performOperation(lapsed.sessionId, 'bond.read', { now: new Date('2026-01-01T00:05:00Z') });
+
+      // One terminal state, three distinguishable reasons — never a bare
+      // "revoked" for a session that merely ran out its clock.
+      expect((await service.performOperation(revoked.sessionId, 'bond.read')).denialReason).toBe('revoked');
+      expect((await service.performOperation(ended.sessionId, 'bond.read')).denialReason).toBe('session_ended');
+      expect((await service.performOperation(lapsed.sessionId, 'bond.read')).denialReason).toBe('expired');
+    });
+
+    it('records the end reason on the session and in the audit trail', async () => {
+      const session = await startSession();
+
+      await service.revoke(session.sessionId, ADMIN);
+
+      expect(service.getSession(session.sessionId)).toMatchObject({
+        endedAt: expect.any(String),
+        endReason: 'revoked',
+      });
+      expect(service.getAuditTrail().some((e) => e.sessionId === session.sessionId && e.event === 'revoked')).toBe(true);
+    });
+
+    it('only the owning maintainer can revoke a session', async () => {
+      const session = await startSession();
+
+      expect(await service.revoke(session.sessionId, NON_ADMIN)).toBe(false);
+      expect((await service.performOperation(session.sessionId, 'bond.read')).allowed).toBe(true);
+    });
+
+    it('an already-ended session cannot be re-ended with a different reason', async () => {
+      const session = await startSession();
+      await service.end(session.sessionId, ADMIN);
+
+      expect(await service.revoke(session.sessionId, ADMIN)).toBe(true); // idempotent
+
+      expect(service.getSession(session.sessionId)!.endReason).toBe('explicit_end');
     });
 
     it('only the owning maintainer can end a session', async () => {
@@ -193,8 +237,8 @@ describe('ImpersonationService (#264)', () => {
 
       const denial = service.getAuditTrail().find((e) => e.event === 'operation_denied');
       expect(denial).toBeDefined();
-      expect(denial.operation).toBe('bond.migrate');
-      expect(denial.detail).toContain('dangerous');
+      expect(denial!.operation).toBe('bond.migrate');
+      expect(denial!.detail).toContain('dangerous');
     });
 
     it('records an expired session as expired, not silently dropped', async () => {
@@ -205,7 +249,7 @@ describe('ImpersonationService (#264)', () => {
 
       const expired = service.getAuditTrail().find((e) => e.event === 'expired');
       expect(expired).toBeDefined();
-      expect(expired.sessionId).toBe(session.sessionId);
+      expect(expired!.sessionId).toBe(session.sessionId);
     });
   });
 

@@ -346,6 +346,12 @@ export class ApiService {
     return this.http.delete<void>(`/api/marketplace/orders/${orderId}`, { headers: this.headers() });
   }
 
+  getTransactionStatus(hash: string): Observable<TransactionStatusResponse> {
+    return this.withProblemDetails(this.http.get<TransactionStatusResponse>(`/api/stellar/transactions/${hash}`, {
+      headers: this.headers(),
+    }));
+  }
+
   getQuoteBalance(asset: QuoteAsset = 'USDC'): Observable<QuoteBalanceResponse> {
     return this.withProblemDetails(this.http.get<QuoteBalanceResponse>('/api/marketplace/quote-balance', {
       params: { asset },

@@ -195,7 +195,7 @@ describe('PrivacyPreservingAnalyticsService', () => {
       expect(metrics).toHaveLength(1);
       expect(metrics[0].eventType).toBe('bond_issuance');
       expect(metrics[0].dimensions.bond_type).toBe('green');
-      expect(metrics[0].metrics.amount_usd_rounded).toBe(1234000);
+      expect(metrics[0].sum.amount_usd_rounded).toBe(1234000);
     });
 
     it('should record investor activity without identity', () => {
@@ -209,7 +209,7 @@ describe('PrivacyPreservingAnalyticsService', () => {
       expect(metrics).toHaveLength(1);
       expect(metrics[0].eventType).toBe('investor_activity');
       expect(metrics[0].dimensions).not.toHaveProperty('investor_id');
-      expect(metrics[0].metrics.success_count).toBe(1);
+      expect(metrics[0].sum.success_count).toBe(1);
     });
   });
 

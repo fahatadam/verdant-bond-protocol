@@ -29,6 +29,9 @@ mod integration {
     fn make_bond_config(env: &Env, project_id: BytesN<32>, total_supply: i128) -> BondConfig {
         BondConfig {
             project_id,
+            credit_vintage: 2024,
+            serial_number_start: 1,
+            serial_number_end: 10_000,
             face_value: 1000,
             coupon_schedule: soroban_sdk::vec![env, 1_000_000u64, 2_000_000u64],
             credit_type: CreditType::Carbon,
@@ -185,7 +188,7 @@ mod integration {
             assert!(result.total_credits > 0);
             assert_eq!(result.holder_count, 1);
 
-            let accrued = contracts.ce_client.accrued_credits(&bond_id, &bob);
+            let accrued = contracts.ce_client.escrowed_credits(&bond_id, &bob);
             assert!(accrued > 0);
 
             let credit_hash = make_ipfs_hash(&env, 42);
@@ -335,6 +338,9 @@ mod integration {
                 credit_type: CreditType::BlueCarbon,
                 maturity_date: 3_000_000,
                 total_supply: 10_000,
+            credit_vintage: 2024,
+            serial_number_start: 1,
+            serial_number_end: 10_000,
             };
             let bond_id = contracts.bi_client.issue_bond(&admin, &config, &0);
             assert_eq!(bond_id, 1);
@@ -384,7 +390,7 @@ mod integration {
             assert!(result.total_credits > 0);
             assert_eq!(result.holder_count, 1);
 
-            let accrued = contracts.ce_client.accrued_credits(&bond_id, &bob);
+            let accrued = contracts.ce_client.escrowed_credits(&bond_id, &bob);
             assert!(accrued > 0);
 
             let credit_hash = make_ipfs_hash(&env, 42);
@@ -707,6 +713,38 @@ mod integration {
     mod dex {
         use super::*;
 
+        fn configure_market(
+            env: &Env,
+            contracts: &TestContracts,
+            admin: &Address,
+            bond_id: u64,
+            price: i128,
+        ) {
+            let quote_asset = Symbol::new(env, "USDC");
+            contracts.dr_client.configure_market(
+                admin,
+                &bond_id,
+                &quote_asset,
+                &1,
+                &10_000,
+                &10_000,
+                &10_000,
+                &i128::MAX,
+                &3_600,
+                &60,
+                &0,
+            );
+            contracts.dr_client.update_oracle_reference(
+                admin,
+                &bond_id,
+                &quote_asset,
+                &price,
+                &env.ledger().timestamp(),
+                &1,
+                &1,
+            );
+        }
+
         #[test]
         fn test_full_settlement_with_seller_withdrawal() {
             let env = Env::default();
@@ -731,6 +769,7 @@ mod integration {
             let config = make_bond_config(&env, project_id, 10_000);
             let bond_id = contracts.bi_client.issue_bond(&admin, &config, &0);
             contracts.bi_client.subscribe(&alice, &bond_id, &5_000, &0);
+            configure_market(&env, &contracts, &admin, bond_id, 100);
 
             let order_id = contracts.dr_client.list_bond_tokens(
                 &alice,
@@ -805,6 +844,7 @@ mod integration {
             let config = make_bond_config(&env, project_id, 10_000);
             let bond_id = contracts.bi_client.issue_bond(&admin, &config, &0);
             contracts.bi_client.subscribe(&alice, &bond_id, &5_000, &0);
+            configure_market(&env, &contracts, &admin, bond_id, 100);
 
             let order_id = contracts.dr_client.list_bond_tokens(
                 &alice,
@@ -853,6 +893,7 @@ mod integration {
             let config = make_bond_config(&env, project_id, 10_000);
             let bond_id = contracts.bi_client.issue_bond(&admin, &config, &0);
             contracts.bi_client.subscribe(&alice, &bond_id, &5_000, &0);
+            configure_market(&env, &contracts, &admin, bond_id, 100);
 
             let order_id = contracts.dr_client.list_bond_tokens(
                 &alice,
@@ -908,6 +949,7 @@ mod integration {
             let config = make_bond_config(&env, project_id, 10_000);
             let bond_id = contracts.bi_client.issue_bond(&admin, &config, &0);
             contracts.bi_client.subscribe(&alice, &bond_id, &5_000, &0);
+            configure_market(&env, &contracts, &admin, bond_id, 100);
 
             let order_id = contracts.dr_client.list_bond_tokens(
                 &alice,
@@ -1054,9 +1096,8 @@ mod integration {
                 .distribute_coupon(&admin, &bond_id, &0, &holders, &report_id, &1);
 
             let total = 100 * nbbs_coupon_engine::CREDIT_MINOR_UNITS;
-            let credits_per_token = total * nbbs_coupon_engine::FIXED_POINT / 3;
             // each holder holds 1 token
-            let per_holder = credits_per_token / nbbs_coupon_engine::FIXED_POINT;
+            let per_holder = total / 3;
             let distributed = per_holder * 3;
 
             assert_eq!(result.total_credits, distributed);
@@ -1510,6 +1551,7 @@ mod integration {
                     .bi_client
                     .subscribe(&alice, &bond_id, &order_amount, &0);
 
+                configure_market(&env, &contracts, &admin, bond_id, price);
                 let quote = Symbol::new(&env, "USDC");
                 let order_id = contracts.dr_client.list_bond_tokens(
                     &alice,
@@ -1643,13 +1685,15 @@ mod integration {
 
                 let mut distributed = 0i128;
                 for (holder, &amount) in holders.iter().zip(balances.iter()) {
+                    let expected = total_credits * amount / total_subscribed;
+                    let accrued = contracts.ce_client.accrued_credits(&bond_id, holder);
                     let cpt = if total_credits > 0 {
                         total_credits * nbbs_coupon_engine::FIXED_POINT / total_subscribed
                     } else {
                         0
                     };
                     let expected = cpt * amount / nbbs_coupon_engine::FIXED_POINT;
-                    let accrued = contracts.ce_client.accrued_credits(&bond_id, holder);
+                    let accrued = contracts.ce_client.escrowed_credits(&bond_id, holder);
                     prop_assert_eq!(accrued, expected);
                     distributed += expected;
                 }
@@ -1827,8 +1871,8 @@ mod integration {
             // distributed, not the pool, so it is the pool minus that dust.
             assert_eq!(dist_result.total_credits, credit_pool - 1);
 
-            let bob_accrued = contracts.ce_client.accrued_credits(&bond_id, &bob);
-            let charlie_accrued = contracts.ce_client.accrued_credits(&bond_id, &charlie);
+            let bob_accrued = contracts.ce_client.escrowed_credits(&bond_id, &bob);
+            let charlie_accrued = contracts.ce_client.escrowed_credits(&bond_id, &charlie);
             let undistributed = contracts.ce_client.get_undistributed_total(&bond_id);
 
             assert_eq!(bob_accrued, 33_333_333);
@@ -1855,7 +1899,7 @@ mod integration {
             );
             let bob_remaining = bob_accrued - ten_credits;
             assert_eq!(
-                contracts.ce_client.accrued_credits(&bond_id, &bob),
+                contracts.ce_client.escrowed_credits(&bond_id, &bob),
                 bob_remaining
             );
             assert_eq!(contracts.cr_client.get_total_retired(&bob), ten_credits);
@@ -1892,7 +1936,7 @@ mod integration {
             );
             let bob_retired = contracts.cr_client.get_total_retired(&bob);
             assert_eq!(bob_retired, bob_accrued);
-            assert_eq!(contracts.ce_client.accrued_credits(&bond_id, &bob), 0);
+            assert_eq!(contracts.ce_client.escrowed_credits(&bond_id, &bob), 0);
             assert!(contracts
                 .cr_client
                 .try_retire_credits(
@@ -1912,7 +1956,7 @@ mod integration {
             // accrued to a holder, or swept. Nothing is created or lost.
             let charlie_retired = contracts.cr_client.get_total_retired(&charlie);
             assert_eq!(charlie_retired, 0);
-            let charlie_remaining = contracts.ce_client.accrued_credits(&bond_id, &charlie);
+            let charlie_remaining = contracts.ce_client.escrowed_credits(&bond_id, &charlie);
             assert_eq!(charlie_remaining, charlie_accrued);
 
             assert_eq!(

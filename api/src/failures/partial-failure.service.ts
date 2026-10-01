@@ -1,13 +1,25 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
+import {
+  activeLifecycle,
+  archiveRecord,
+  assertNotArchived,
+  includeArchived,
+  isArchived,
+  restoreRecord,
+  visibleOnly,
+} from '../common/lifecycle/record-lifecycle';
 import { NotificationsService } from '../notifications/notifications.service';
 import {
   DEFAULT_STALE_AFTER_MS,
+  DependencyGraph,
+  FailureTrendExport,
+  PartialFailureListFilter,
   PartialFailure,
   PartialFailureDashboard,
   PartialFailureGroup,
   PartialFailureInput,
   PartialFailureLinks,
-  PartialFailureStatus,
+  RejectedOperationExplanation,
 } from './partial-failure.interface';
 
 /** Remediation docs per operation kind — the "manual remediation" links. */
@@ -27,7 +39,7 @@ function remediationDoc(operationType: string): string {
  * case-insensitive on the whole key name.
  */
 const SECRET_KEY_PATTERN =
-  /secret|password|privatekey|private_key|seed|mnemonic|token|apikey|api_key/i;
+  /secret|password|passphrase|privatekey|private_key|seed|mnemonic|token|apikey|api_key/i;
 
 function scrub(value: unknown, depth = 0): unknown {
   if (depth > 6) return '[truncated]';
@@ -51,7 +63,7 @@ export class PartialFailureService {
   private readonly logger = new Logger(PartialFailureService.name);
   private readonly failures = new Map<string, PartialFailure>();
 
-  constructor(private readonly notificationsService: NotificationsService) {}
+  constructor(@Optional() private readonly notificationsService?: NotificationsService) {}
 
   /**
    * Record a partially completed operation. Metadata is deep-scrubbed so
@@ -75,6 +87,7 @@ export class PartialFailureService {
       lastFailureAt: new Date(now).toISOString(),
       retryCount: 0,
       metadata: (scrub(input.metadata ?? {}) ?? {}) as Record<string, unknown>,
+      lifecycle: activeLifecycle(),
     };
     this.failures.set(failure.id, failure);
     this.logger.warn(`partial failure recorded: ${input.operationType}`, {
@@ -83,7 +96,7 @@ export class PartialFailureService {
     });
 
     if (failure.severity === 'warning' || failure.severity === 'critical') {
-      this.notificationsService.createNotification({
+      this.notificationsService?.createNotification({
         userId: 'admin', // assuming this is a system admin notification
         type: 'PARTIAL_FAILURE',
         message: `Partial failure in ${failure.operationType}: ${failure.message}`,
@@ -112,27 +125,56 @@ export class PartialFailureService {
     return failure;
   }
 
+  /**
+   * A record that has been archived is out of play: it is neither a live
+   * failure to resolve nor a retry to count. Work actions on an archived
+   * record must be refused rather than silently mutating a hidden record.
+   */
+  private requireLive(id: string): PartialFailure {
+    const failure = this.get(id);
+    assertNotArchived(failure, `acting on partial failure ${id}`);
+    return failure;
+  }
+
   /** Resolve a failure after manual (or automatic) remediation. */
   resolve(id: string, note?: string, now: number = Date.now()): PartialFailure {
-    const failure = this.get(id);
+    const failure = this.requireLive(id);
     failure.status = 'resolved';
     failure.resolvedAt = new Date(now).toISOString();
     failure.resolvedNote = note;
     return failure;
   }
 
-  /** Manually ignore a failure (documented decision, hidden from the board). */
-  ignore(id: string, note?: string, now: number = Date.now()): PartialFailure {
+  /**
+   * Archive a failure: a documented decision to stop tracking it, with the
+   * operator, the timestamp and the justification recorded on the record.
+   * The record is never destroyed — it stays queryable with `includeArchived`.
+   */
+  archive(id: string, actor: string, reason: string, now: number = Date.now()): PartialFailure {
     const failure = this.get(id);
-    failure.status = 'ignored';
-    failure.ignoredAt = new Date(now).toISOString();
-    failure.ignoredNote = note;
+    archiveRecord(failure.lifecycle, { actor, reason, now });
+    this.logger.log(`partial failure archived: ${failure.operationType}`, {
+      id: failure.id,
+      actor,
+      reason,
+    });
+    return failure;
+  }
+
+  /** Reverse an archive. The archive itself stays in the record's history. */
+  restore(id: string, actor: string, now: number = Date.now()): PartialFailure {
+    const failure = this.get(id);
+    restoreRecord(failure.lifecycle, { actor, now });
+    this.logger.log(`partial failure restored: ${failure.operationType}`, {
+      id: failure.id,
+      actor,
+    });
     return failure;
   }
 
   /** Mark a retry as attempted: bumps the counter and flips status. */
   markRetried(id: string, now: number = Date.now()): PartialFailure {
-    const failure = this.get(id);
+    const failure = this.requireLive(id);
     failure.retryCount += 1;
     failure.status = 'retrying';
     failure.lastFailureAt = new Date(now).toISOString();
@@ -150,14 +192,25 @@ export class PartialFailureService {
   }
 
   list(
-    filter: { operationType?: string; status?: PartialFailureStatus; retryable?: boolean } = {},
+    filter: PartialFailureListFilter = {},
     now: number = Date.now(),
   ): PartialFailure[] {
     const result: PartialFailure[] = [];
-    for (const failure of this.failures.values()) {
+    for (const failure of includeArchived([...this.failures.values()], filter.includeArchived === true)) {
       if (filter.operationType && failure.operationType !== filter.operationType) continue;
       if (filter.status && failure.status !== filter.status) continue;
+      if (filter.severity && failure.severity !== filter.severity) continue;
       if (filter.retryable !== undefined && failure.retryable !== filter.retryable) continue;
+      if (filter.externalRef && failure.externalRef !== filter.externalRef) continue;
+      if (filter.minRetryCount !== undefined && failure.retryCount < filter.minRetryCount) continue;
+      if (filter.createdAfter && Date.parse(failure.createdAt) < Date.parse(filter.createdAfter)) continue;
+      if (filter.createdBefore && Date.parse(failure.createdAt) > Date.parse(filter.createdBefore)) continue;
+      if (filter.staleOnly && now - Date.parse(failure.createdAt) < DEFAULT_STALE_AFTER_MS) continue;
+      if (filter.text) {
+        const needle = filter.text.toLowerCase();
+        const haystack = `${failure.operationType} ${failure.externalRef ?? ''} ${failure.message} ${JSON.stringify(failure.metadata)}`.toLowerCase();
+        if (!haystack.includes(needle)) continue;
+      }
       result.push(failure);
     }
     return result;
@@ -167,26 +220,54 @@ export class PartialFailureService {
    * Group unresolved (and recently resolved) failures by operation type for
    * the maintainer dashboard. Every row carries its age, staleness and the
    * retry/inspect/remediation links — no secrets.
+   *
+   * Archived failures are never rendered as board rows by default, but they
+   * are *counted* — the board and the trend export agree on how many were
+   * archived, so the two views cannot drift apart the way a board-only filter
+   * and an export that ignored the filter would. `filter.includeArchived` adds
+   * them back as rows for an operator auditing who archived what, and why.
    */
   dashboard(
-    opts: { staleAfterMs?: number; now?: number } = {},
+    opts: { staleAfterMs?: number; now?: number; filter?: PartialFailureListFilter } = {},
   ): PartialFailureDashboard {
     const now = opts.now ?? Date.now();
     const staleAfterMs = opts.staleAfterMs ?? DEFAULT_STALE_AFTER_MS;
+    const filter = opts.filter ?? {};
+    // One pass over both views, so the live rows and the archived tally are
+    // computed from the same filtered set.
+    const all = this.list({ ...filter, includeArchived: true }, now);
 
     const byType = new Map<string, PartialFailure[]>();
-    for (const failure of this.failures.values()) {
-      if (failure.status === 'ignored') continue; // manually ignored: documented decision
+    const archivedRowsByType = new Map<string, PartialFailure[]>();
+    let archived = 0;
+    for (const failure of all) {
+      if (isArchived(failure)) {
+        archived += 1;
+        // With `includeArchived`, the operator also sees the rows themselves,
+        // each still carrying its `lifecycle` attribution, so the audit view is
+        // not a count they have to cross-reference back to `GET …/:id`.
+        const archivedRows = archivedRowsByType.get(failure.operationType) ?? [];
+        archivedRows.push(failure);
+        archivedRowsByType.set(failure.operationType, archivedRows);
+        continue;
+      }
       const bucket = byType.get(failure.operationType) ?? [];
       bucket.push(failure);
       byType.set(failure.operationType, bucket);
     }
 
+    // An operation type whose only failures were archived still belongs on the
+    // board — with its archived tally — rather than silently vanishing.
+    for (const operationType of archivedRowsByType.keys()) {
+      if (!byType.has(operationType)) byType.set(operationType, []);
+    }
+
+    const showArchived = filter.includeArchived === true;
     const groups: PartialFailureGroup[] = [];
     let unresolved = 0;
     for (const [operationType, bucket] of byType) {
       bucket.sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
-      const byStatus = { open: 0, retrying: 0, resolved: 0, ignored: 0 };
+      const byStatus = { open: 0, retrying: 0, resolved: 0 };
       const bySeverity = { info: 0, warning: 0, critical: 0 };
       let retryable = 0;
       let oldestAgeMs: number | null = null;
@@ -204,11 +285,20 @@ export class PartialFailureService {
           links: this.linksFor(failure),
         };
       });
+
+      const archivedRows = archivedRowsByType.get(operationType) ?? [];
+      if (showArchived) {
+        const archivedAt = (failure: PartialFailure) => failure.lifecycle.archivedAt ?? failure.createdAt;
+        for (const failure of archivedRows.sort((a, b) => Date.parse(archivedAt(b)) - Date.parse(archivedAt(a)))) {
+          rows.push({ ...failure, ageMs: now - Date.parse(failure.createdAt), stale: false, links: this.linksFor(failure) });
+        }
+      }
       groups.push({
         operationType,
         total: bucket.length,
         byStatus,
         bySeverity,
+        archived: archivedRows.length,
         retryable,
         oldestAgeMs,
         failures: rows,
@@ -220,6 +310,7 @@ export class PartialFailureService {
       generatedAt: new Date(now).toISOString(),
       unresolved,
       staleAfterMs,
+      archived,
       groups,
     };
   }
@@ -231,6 +322,182 @@ export class PartialFailureService {
         : undefined,
       inspect: `GET /api/v1/operations/failures/${failure.id}`,
       remediationDoc: remediationDoc(failure.operationType),
+    };
+  }
+
+  explainRejectedOperation(code: string, context: Record<string, unknown> = {}): RejectedOperationExplanation {
+    const normalized = String(code || 'unknown').toLowerCase();
+    const known: Record<string, Omit<RejectedOperationExplanation, 'supportReference'>> = {
+      kyc_required: {
+        code: 'kyc_required',
+        title: 'Identity verification is required',
+        userMessage: 'This operation cannot continue until the account completes identity verification.',
+        nextActions: ['Complete verification from account settings.', 'Retry the operation after verification is approved.'],
+        retryable: true,
+      },
+      insufficient_balance: {
+        code: 'insufficient_balance',
+        title: 'Insufficient balance',
+        userMessage: 'The wallet does not have enough spendable balance for this operation and network fees.',
+        nextActions: ['Add funds to the wallet.', 'Confirm no pending operation is reserving the same balance.', 'Retry after the ledger reflects the new balance.'],
+        retryable: true,
+      },
+      policy_denied: {
+        code: 'policy_denied',
+        title: 'Operation rejected by policy',
+        userMessage: 'A protocol policy prevented this request from being accepted.',
+        nextActions: ['Review the request details.', 'Contact support if the policy result looks incorrect.'],
+        retryable: false,
+      },
+    };
+    const explanation = known[normalized] ?? {
+      code: normalized || 'unknown',
+      title: 'Operation rejected',
+      userMessage: 'The operation was rejected before it could be submitted.',
+      nextActions: ['Review the request details.', 'Retry only after correcting the highlighted issue.'],
+      retryable: false,
+    };
+
+    return {
+      ...explanation,
+      supportReference: typeof context.supportReference === 'string'
+        ? context.supportReference
+        : undefined,
+    };
+  }
+
+  dependencyGraph(rootId?: string, now: number = Date.now()): DependencyGraph {
+    const nodes = new Map<string, DependencyGraph['nodes'][number]>();
+    const edges: DependencyGraph['edges'] = [];
+    const impactedFailures = new Set<string>();
+
+    const addNode = (id: string, kind: string, label: string, failure?: PartialFailure) => {
+      if (!nodes.has(id)) {
+        nodes.set(id, {
+          id,
+          kind,
+          label,
+          status: failure?.status,
+          severity: failure?.severity,
+        });
+      }
+    };
+
+    for (const failure of visibleOnly([...this.failures.values()])) {
+      const failureNode = `failure:${failure.id}`;
+      addNode(failureNode, 'failure', failure.message, failure);
+      const operationNode = `operation:${failure.operationType}`;
+      addNode(operationNode, 'operation', failure.operationType);
+      edges.push({ from: operationNode, to: failureNode, relation: 'has_failure' });
+
+      if (failure.externalRef) {
+        const externalNode = `external:${failure.externalRef}`;
+        addNode(externalNode, 'external_ref', failure.externalRef);
+        edges.push({ from: failureNode, to: externalNode, relation: 'references' });
+      }
+
+      const dependencies = Array.isArray(failure.metadata?.dependsOn)
+        ? failure.metadata.dependsOn
+        : [];
+      for (const dependency of dependencies) {
+        const dependencyId = String(dependency);
+        const dependencyNode = `resource:${dependencyId}`;
+        addNode(dependencyNode, 'resource', dependencyId);
+        edges.push({ from: failureNode, to: dependencyNode, relation: 'depends_on' });
+        if (!rootId || dependencyNode === rootId || dependencyId === rootId) {
+          impactedFailures.add(failure.id);
+        }
+      }
+
+      if (!rootId || failureNode === rootId || operationNode === rootId || failure.externalRef === rootId) {
+        impactedFailures.add(failure.id);
+      }
+    }
+
+    return {
+      generatedAt: new Date(now).toISOString(),
+      nodes: [...nodes.values()],
+      edges,
+      impactedFailures: [...impactedFailures],
+    };
+  }
+
+  /**
+   * Bucketed operational history. Archived failures are included in `total`
+   * and reported in their own `archived` column, so this export and the board
+   * describe the same population — the export is not a superset of what an
+   * operator can actually see.
+   */
+  trendExport(opts: {
+    bucketMs?: number;
+    format?: 'json' | 'csv';
+    from?: number;
+    to?: number;
+    now?: number;
+  } = {}): FailureTrendExport {
+    const bucketMs = opts.bucketMs ?? 24 * 60 * 60 * 1000;
+    const format = opts.format ?? 'json';
+    const now = opts.now ?? Date.now();
+    const failures = [...this.failures.values()].filter((failure) => {
+      const created = Date.parse(failure.createdAt);
+      if (opts.from !== undefined && created < opts.from) return false;
+      if (opts.to !== undefined && created > opts.to) return false;
+      return true;
+    });
+
+    const buckets = new Map<number, FailureTrendExport['buckets'][number]>();
+    for (const failure of failures) {
+      const created = Date.parse(failure.createdAt);
+      const start = Math.floor(created / bucketMs) * bucketMs;
+      const bucket = buckets.get(start) ?? {
+        bucketStart: new Date(start).toISOString(),
+        bucketEnd: new Date(start + bucketMs).toISOString(),
+        total: 0,
+        unresolved: 0,
+        archived: 0,
+        retryable: 0,
+        bySeverity: { info: 0, warning: 0, critical: 0 },
+        byStatus: { open: 0, retrying: 0, resolved: 0 },
+      };
+      bucket.total += 1;
+      if (isArchived(failure)) {
+        bucket.archived += 1;
+      } else {
+        if (failure.status !== 'resolved') bucket.unresolved += 1;
+        bucket.bySeverity[failure.severity] += 1;
+        bucket.byStatus[failure.status] += 1;
+      }
+      if (failure.retryable) bucket.retryable += 1;
+      buckets.set(start, bucket);
+    }
+
+    const sorted = [...buckets.entries()].sort(([a], [b]) => a - b).map(([, bucket]) => bucket);
+    const csv = format === 'csv'
+      ? [
+          'bucketStart,bucketEnd,total,unresolved,archived,retryable,info,warning,critical,open,retrying,resolved',
+          ...sorted.map((bucket) => [
+            bucket.bucketStart,
+            bucket.bucketEnd,
+            bucket.total,
+            bucket.unresolved,
+            bucket.archived,
+            bucket.retryable,
+            bucket.bySeverity.info,
+            bucket.bySeverity.warning,
+            bucket.bySeverity.critical,
+            bucket.byStatus.open,
+            bucket.byStatus.retrying,
+            bucket.byStatus.resolved,
+          ].join(',')),
+        ].join('\n')
+      : undefined;
+
+    return {
+      generatedAt: new Date(now).toISOString(),
+      format,
+      bucketMs,
+      buckets: sorted,
+      csv,
     };
   }
 

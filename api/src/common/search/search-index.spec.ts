@@ -8,8 +8,8 @@
 
 import { Test, TestingModule } from '@nestjs/testing';
 import { SearchIndexService, VisibilityLevel, EntityType, IndexEntry, defaultPermissionChecker } from './search-index.service';
-import { RedisService } from './redis.service';
-import { ConfigService } from '../config/config.service';
+import { RedisService } from '../services/redis.service';
+import { ConfigService } from '../../config/config.service';
 
 jest.mock('@redis/client', () => {
   const mockClient = {
@@ -24,16 +24,28 @@ jest.mock('@redis/client', () => {
   return { createClient: jest.fn().mockReturnValue(mockClient) };
 });
 
+/** In-memory stand-in for the RedisService methods the index uses. */
+function inMemoryRedis() {
+  const values = new Map<string, string>();
+  const sets = new Map<string, Set<string>>();
+  return {
+    get: jest.fn(async (key: string) => values.get(key) ?? null),
+    setEx: jest.fn(async (key: string, _seconds: number, value: string) => {
+      values.set(key, value);
+    }),
+    del: jest.fn(async (key: string) => {
+      values.delete(key);
+    }),
+    sAdd: jest.fn(async (key: string, member: string) => {
+      sets.set(key, (sets.get(key) ?? new Set()).add(member));
+    }),
+    sMembers: jest.fn(async (key: string) => [...(sets.get(key) ?? [])]),
+  };
+}
+
 const redisProvider = {
   provide: RedisService,
-  useValue: {
-    get: jest.fn().mockResolvedValue(null),
-    setEx: jest.fn().mockResolvedValue('OK'),
-    del: jest.fn().mockResolvedValue(1),
-    sAdd: jest.fn().mockResolvedValue(1),
-    sMembers: jest.fn().mockResolvedValue([]),
-    scan: jest.fn().mockResolvedValue({ cursor: 0, keys: [] }),
-  },
+  useFactory: inMemoryRedis,
 };
 
 const configProvider = {
@@ -92,50 +104,40 @@ describe('Permission-Aware Search Index (#275)', () => {
   });
 
   describe('permission-filtered search', () => {
-    it('returns public entries for any viewer', async () => {
-      const entry = createMockEntry({ visibility: VisibilityLevel.PUBLIC });
-      await service.upsert(entry);
-      jest.spyOn(redisProvider.useValue, 'sMembers').mockReturnValue([JSON.stringify(entry)]);
-      jest.spyOn(redisProvider.useValue, 'get').mockResolvedValue(JSON.stringify(entry));
+    const VIEWER = 'GVIEWERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
+    const OWNER = 'GOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
 
-      const result = await service.search(EntityType.BOND, '', 'GVIEWERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA');
-      expect(result.total).toBeGreaterThanOrEqual(0);
+    it('returns public entries for any viewer', async () => {
+      await service.upsert(createMockEntry({ visibility: VisibilityLevel.PUBLIC }));
+
+      const result = await service.search(EntityType.BOND, '', VIEWER);
+      expect(result.total).toBe(1);
+      expect(result.entries[0].recordId).toBe('bond-1');
     });
 
     it('does not return hidden entries for unauthorized viewers', async () => {
-      const hiddenEntry = createMockEntry({
-        visibility: VisibilityLevel.HIDDEN,
-        recordId: 'hidden-bond',
-        id: 'hidden-entry',
-      });
-      const publicEntry = createMockEntry({ recordId: 'public-bond', id: 'public-entry' });
+      await service.upsert(
+        createMockEntry({ visibility: VisibilityLevel.HIDDEN, recordId: 'hidden-bond', id: 'hidden-entry' }),
+      );
+      await service.upsert(createMockEntry({ recordId: 'public-bond', id: 'public-entry' }));
 
-      const allKeys = [JSON.stringify(hiddenEntry), JSON.stringify(publicEntry)];
-      jest.spyOn(redisProvider.useValue, 'sMembers').mockReturnValue(allKeys);
-      jest.spyOn(redisProvider.useValue, 'get')
-        .mockResolvedValueOnce(JSON.stringify(hiddenEntry))
-        .mockResolvedValueOnce(JSON.stringify(publicEntry));
-
-      const result = await service.search(EntityType.BOND, '', 'GVIEWERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA');
-      const hiddenResults = result.entries.filter((e) => e.visibility === VisibilityLevel.HIDDEN);
-      expect(hiddenResults).toHaveLength(0);
+      const result = await service.search(EntityType.BOND, '', VIEWER);
+      expect(result.entries.map((e) => e.recordId)).toEqual(['public-bond']);
     });
 
     it('returns restricted entries only for the owner', async () => {
-      const restrictedEntry = createMockEntry({
-        visibility: VisibilityLevel.RESTRICTED,
-        recordId: 'restricted-bond',
-        id: 'restricted-entry',
-        ownerAddress: 'GOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
-        permissions: ['GOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'],
-      });
+      await service.upsert(
+        createMockEntry({
+          visibility: VisibilityLevel.RESTRICTED,
+          recordId: 'restricted-bond',
+          id: 'restricted-entry',
+          ownerAddress: OWNER,
+          permissions: [OWNER],
+        }),
+      );
 
-      jest.spyOn(redisProvider.useValue, 'sMembers').mockReturnValue([JSON.stringify(restrictedEntry)]);
-      jest.spyOn(redisProvider.useValue, 'get').mockResolvedValue(JSON.stringify(restrictedEntry));
-
-      // Owner can see it
-      const ownerResult = await service.search(EntityType.BOND, '', 'GOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA');
-      expect(ownerResult.total).toBeGreaterThanOrEqual(0);
+      expect((await service.search(EntityType.BOND, '', OWNER)).total).toBe(1);
+      expect((await service.search(EntityType.BOND, '', VIEWER)).total).toBe(0);
     });
   });
 

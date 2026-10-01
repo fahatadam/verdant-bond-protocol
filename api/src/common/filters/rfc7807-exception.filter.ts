@@ -57,6 +57,9 @@ export class Rfc7807ExceptionFilter implements ExceptionFilter {
     let status = 500;
     let title = 'Internal Server Error';
     let detail = 'An unexpected error occurred';
+    let code: string = ErrorCode.INTERNAL_ERROR;
+    let errors: ProblemDetail['errors'];
+    let contract: ProblemDetail['contract'];
     let retryable = false;
 
     if (exception instanceof DomainException) {

@@ -28,6 +28,12 @@ pub enum BondError {
     OracleStaleManualInterventionRequired = 18,
     /// Coupon distribution is frozen because the project has an active dispute (#193).
     ProjectDisputedAndFrozen = 19,
+    /// Waterfall priorities or balances are invalid.
+    InvalidWaterfall = 20,
+    /// A holder already claimed this priority from this waterfall settlement.
+    WaterfallAlreadyClaimed = 21,
+    /// Requested issuer balance checkpoint is newer than the stored snapshot.
+    InvalidBalanceSnapshot = 22,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -69,6 +75,18 @@ pub enum DEXError {
     ZeroAmount = 9,
     InsufficientFunds = 10,
     Overflow = 11,
+    InvalidCommitment = 12,
+    RevealTooEarly = 13,
+    RevealWindowClosed = 14,
+    MarketNotConfigured = 15,
+    InvalidMarketConfig = 16,
+    OracleStale = 17,
+    OraclePaused = 18,
+    PriceDeviationExceeded = 19,
+    LedgerVolumeExceeded = 20,
+    OracleZeroVolume = 21,
+    InvalidOraclePrice = 22,
+    OracleLowVolume = 23,
 }
 
 #[derive(Clone, Debug, PartialEq)]

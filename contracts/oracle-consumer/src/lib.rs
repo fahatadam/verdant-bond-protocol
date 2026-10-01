@@ -492,9 +492,10 @@ impl OracleConsumer {
             env.storage()
                 .instance()
                 .set(&DataKey::Report(report_id), &report);
-            env.storage()
-                .instance()
-                .set(&DataKey::ProjectLastVerifiedAt(report.project_id.clone()), &report.verified_at);
+            env.storage().instance().set(
+                &DataKey::ProjectLastVerifiedAt(report.project_id.clone()),
+                &report.verified_at,
+            );
 
             env.events()
                 .publish((Symbol::new(&env, "report_verified"),), (report_id,));
@@ -698,7 +699,9 @@ impl OracleConsumer {
         if quorum == 0 {
             return Err(OracleError::InsufficientQuorum);
         }
-        env.storage().instance().set(&DataKey::MinimumQuorum, &quorum);
+        env.storage()
+            .instance()
+            .set(&DataKey::MinimumQuorum, &quorum);
         Ok(())
     }
 
@@ -736,7 +739,11 @@ impl OracleConsumer {
         let mut report_providers: Vec<(u64, Address, i128)> = vec![&env];
 
         for rid in report_ids.iter() {
-            if let Some(r) = env.storage().instance().get::<_, Report>(&DataKey::Report(rid)) {
+            if let Some(r) = env
+                .storage()
+                .instance()
+                .get::<_, Report>(&DataKey::Report(rid))
+            {
                 if r.period_start == period_start && r.period_end == period_end {
                     if let Some(p) = env
                         .storage()
@@ -745,14 +752,18 @@ impl OracleConsumer {
                     {
                         if p.active {
                             values.push_back(r.carbon_sequestered);
-                            report_providers.push_back((rid, r.provider.clone(), r.carbon_sequestered));
+                            report_providers.push_back((
+                                rid,
+                                r.provider.clone(),
+                                r.carbon_sequestered,
+                            ));
                         }
                     }
                 }
             }
         }
 
-        if (values.len() as u32) < min_quorum {
+        if values.len() < min_quorum {
             return Err(OracleError::InsufficientQuorum);
         }
 
@@ -827,7 +838,9 @@ impl OracleConsumer {
         }
         set_nonce(&env, &caller, expected_nonce + 1);
         require_admin(&env, &caller)?;
-        env.storage().instance().set(&DataKey::MinimumDisputeBond, &bond_amount);
+        env.storage()
+            .instance()
+            .set(&DataKey::MinimumDisputeBond, &bond_amount);
         Ok(())
     }
 
@@ -868,11 +881,16 @@ impl OracleConsumer {
             threshold2_secs,
             conservatism_discount_bps,
         };
-        env.storage().instance().set(&DataKey::ProjectStalenessConfig(project_id), &config);
+        env.storage()
+            .instance()
+            .set(&DataKey::ProjectStalenessConfig(project_id), &config);
         Ok(())
     }
 
-    pub fn get_project_staleness_config(env: Env, project_id: BytesN<32>) -> ProjectStalenessConfig {
+    pub fn get_project_staleness_config(
+        env: Env,
+        project_id: BytesN<32>,
+    ) -> ProjectStalenessConfig {
         env.storage()
             .instance()
             .get(&DataKey::ProjectStalenessConfig(project_id))

@@ -19,7 +19,8 @@ export class AuditInterceptor implements NestInterceptor {
 
     // We only audit sensitive actions (mutations)
     if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) {
-      const user = request.user || { sub: 'anonymous' };
+      // JwtStrategy populates walletAddress; unauthenticated requests have no user.
+      const actor: string = request.user?.walletAddress ?? 'anonymous';
       const url = request.url;
       const body = { ...request.body };
 
@@ -33,9 +34,10 @@ export class AuditInterceptor implements NestInterceptor {
           const auditEvent: AuditWrite = {
             entityType: 'http_request',
             entityId: url,
-            principal: user.sub,
+            actor,
             action: method,
-            payload: JSON.stringify(body),
+            before: null,
+            after: body,
           };
 
           try {
