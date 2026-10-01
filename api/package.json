@@ -15,6 +15,7 @@
     "seed:reset": "ts-node scripts/seed.ts --reset",
     "reindex-holders": "ts-node scripts/reindex-holders.ts",
     "validate:recovery": "ts-node scripts/validate-recovery.ts",
+    "validate:rollback": "ts-node scripts/validate-rollback.ts",
     "diagnostics": "ts-node scripts/diagnostics.ts",
     "mutate": "stryker run stryker-config.json",
     "test:mutate": "stryker run stryker-config.json --thresholds.break 50"
